@@ -1,0 +1,98 @@
+desc:Sieve-Tuned Feedback Delay Network (resonant, not diffusive)
+slider1:fundamental=110<20,880,0.01>Fundamental (Hz)
+slider2:fb=0.85<0,0.99,0.001>Feedback Gain
+slider3:damp=0.3<0,0.99,0.001>Damping (HF loss per pass)
+slider4:detune=0.002<0,0.02,0.0001>Random Detune Depth
+slider5:mix=0.5<0,1,0.01>Dry/Wet
+
+@init
+MAXDELAY = 96000; // 2s headroom at 48k
+
+// Standard FDN reverb design picks delay-line ratios to AVOID audible pitch
+// (irrational/prime-ish ratios, to keep the tail smooth and non-tonal). Here
+// we deliberately invert that: ratios are small-integer / sieve-derived, so
+// the network resonates on an audible, tunable interval set instead of
+// diffusing into noise. Swap these for output from the sieve engine sketch
+// to drive the tuning directly from a Xenakis sieve.
+ratio0 = 1;
+ratio1 = 9/8;
+ratio2 = 4/3;
+ratio3 = 3/2;
+
+dl0 = 0; dl1 = MAXDELAY; dl2 = MAXDELAY*2; dl3 = MAXDELAY*3;
+wpos0 = 0; wpos1 = 0; wpos2 = 0; wpos3 = 0;
+lp0 = 0; lp1 = 0; lp2 = 0; lp3 = 0;
+det0 = 0; det1 = 0; det2 = 0; det3 = 0;
+
+function delaylen(ratio)
+(
+  srate / (fundamental*ratio);
+);
+
+function fracread(bufbase, writepos, delaysamples)
+  local(readpos, ip, fr, a, b)
+(
+  readpos = writepos - delaysamples;
+  readpos < 0 ? readpos += MAXDELAY;
+  ip = floor(readpos);
+  fr = readpos - ip;
+  a = bufbase[ip];
+  b = bufbase[(ip+1)%MAXDELAY];
+  a + (b-a)*fr;
+);
+
+// Normalized 4x4 Hadamard mix: a lossless (energy-preserving) feedback
+// matrix, the standard choice for a well-behaved FDN. Writes results to
+// globals out0..out3 since EEL2 functions return a single value.
+function hadamard4(a,b,c,d)
+  local(h0,h1,h2,h3)
+(
+  h0 = (a+b+c+d)*0.5;
+  h1 = (a-b+c-d)*0.5;
+  h2 = (a+b-c-d)*0.5;
+  h3 = (a-b-c+d)*0.5;
+  out0=h0; out1=h1; out2=h2; out3=h3;
+);
+
+@sample
+// slow independent random-walk detune per line keeps the resonances alive
+// rather than static/dead-locked - subtle chorus-like motion on each partial
+det0 += (rand(2)-1)*detune*0.01; det0 = max(min(det0,detune),-detune);
+det1 += (rand(2)-1)*detune*0.01; det1 = max(min(det1,detune),-detune);
+det2 += (rand(2)-1)*detune*0.01; det2 = max(min(det2,detune),-detune);
+det3 += (rand(2)-1)*detune*0.01; det3 = max(min(det3,detune),-detune);
+
+d0 = delaylen(ratio0)*(1+det0);
+d1 = delaylen(ratio1)*(1+det1);
+d2 = delaylen(ratio2)*(1+det2);
+d3 = delaylen(ratio3)*(1+det3);
+
+r0 = fracread(dl0, wpos0, d0);
+r1 = fracread(dl1, wpos1, d1);
+r2 = fracread(dl2, wpos2, d2);
+r3 = fracread(dl3, wpos3, d3);
+
+// one-pole damping filter per feedback path: higher partials decay faster,
+// as in a real resonant body, and it keeps the network numerically stable
+lp0 += (r0-lp0)*(1-damp);
+lp1 += (r1-lp1)*(1-damp);
+lp2 += (r2-lp2)*(1-damp);
+lp3 += (r3-lp3)*(1-damp);
+
+hadamard4(lp0,lp1,lp2,lp3);
+
+input = (spl0+spl1)*0.5;
+
+dl0[wpos0] = input + out0*fb;
+dl1[wpos1] = input + out1*fb;
+dl2[wpos2] = input + out2*fb;
+dl3[wpos3] = input + out3*fb;
+
+wpos0 = (wpos0+1)%MAXDELAY;
+wpos1 = (wpos1+1)%MAXDELAY;
+wpos2 = (wpos2+1)%MAXDELAY;
+wpos3 = (wpos3+1)%MAXDELAY;
+
+wet = (r0+r1+r2+r3)*0.25;
+spl0 = spl0*(1-mix) + wet*mix;
+spl1 = spl1*(1-mix) + wet*mix;

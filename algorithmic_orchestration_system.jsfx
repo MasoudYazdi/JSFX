@@ -1,0 +1,333 @@
+desc:Algorithmic Orchestration System
+//tags: MIDI generative orchestration sieve-theory entropy euclidean
+//author: ComposerOS / Mass
+//
+// ─────────────────────────────────────────────────────────────────────────
+// ARCHITECTURE
+// ─────────────────────────────────────────────────────────────────────────
+// This is a MIDI-FX "orchestrator": it does not synthesize audio. It takes
+// an incoming monophonic or polyphonic MIDI stream (a seed line, a chord,
+// a generative sequence from upstream) and re-distributes each note across
+// up to 8 independent "orchestral voices," each with its own output MIDI
+// channel, so downstream instruments/samplers can be assigned per voice.
+//
+// Four compositional mechanisms govern whether/how a voice sounds a given
+// input note, deliberately mirroring the vocabulary already used elsewhere
+// in this practice (Entropic Cluster Engine, Confluence, sieve-based pitch
+// work):
+//
+//   1. SIEVE FILTER      Xenakis-style: each voice owns a 12-bit mask over
+//                         pitch classes (mod 12). A note only reaches a
+//                         voice if its pitch class is a member of that
+//                         voice's sieve. This is what gives voices a
+//                         structural identity (e.g. voice 1 = {0,3,6,9}).
+//
+//   2. EUCLIDEAN GATE     Per-voice E(k,n) rhythm, advanced one step per
+//                         incoming note-on event (not clock-locked). This
+//                         produces hocket / antiphonal textures — a voice
+//                         that passes the sieve still only fires on its
+//                         allotted pulses.
+//
+//   3. ENTROPY            A single global control [0,1] scales every
+//                         voice's firing probability: low entropy = sparse,
+//                         predictable, few-voice textures; high entropy =
+//                         dense, quasi-tutti, chaotic doublings. This is
+//                         literally the "randomness budget" of the texture,
+//                         same conceptual role as in the Entropic Cluster
+//                         Engine's Shannon-entropy control.
+//
+//   4. GAUSSIAN REGISTER   Each voice has a register band [lo,hi]. A firing
+//      PLACEMENT           voice doesn't just repeat the input octave — it
+//                         picks the octave transposition of its pitch class
+//                         nearest a Gaussian-distributed target centered on
+//                         the band's midpoint, spread controlled by the
+//                         global Jitter control. This is the "orchestration"
+//                         proper: the same pitch class lands in a register
+//                         appropriate to that voice.
+//
+// The @gfx view renders each voice as a horizontal register band (flashing
+// on activation) plus a row of 12 dots showing its sieve — a direct visual
+// readout of the sieve theory driving the texture.
+//
+// Note-off is tracked per (input note, voice) so polyphony and overlapping
+// notes resolve correctly even under heavy re-triggering.
+// ─────────────────────────────────────────────────────────────────────────
+
+in_pin:none
+out_pin:none
+
+slider1:entropy=0.5<0,1,0.001>Entropy (Texture Density)
+slider2:seed=1<1,999999,1>Random Seed
+slider3:max_voices=8<1,8,1>Max Simultaneous Voices
+slider4:jitter=7<0,24,0.1>Register Jitter (semitones, Gaussian σ)
+
+slider5:1<1,16,1>V1 MIDI Channel
+slider6:28<0,127,1>V1 Register Low
+slider7:48<0,127,1>V1 Register High
+slider8:585<0,4095,1>V1 Sieve Mask (mod3 res0)
+slider9:8<1,16,1>V1 Euclid Steps
+slider10:3<0,16,1>V1 Euclid Pulses
+slider11:0.9<0,1,0.01>V1 Base Probability
+
+slider12:2<1,16,1>V2 MIDI Channel
+slider13:36<0,127,1>V2 Register Low
+slider14:60<0,127,1>V2 Register High
+slider15:1170<0,4095,1>V2 Sieve Mask (mod3 res1)
+slider16:8<1,16,1>V2 Euclid Steps
+slider17:5<0,16,1>V2 Euclid Pulses
+slider18:0.8<0,1,0.01>V2 Base Probability
+
+slider19:3<1,16,1>V3 MIDI Channel
+slider20:48<0,127,1>V3 Register Low
+slider21:67<0,127,1>V3 Register High
+slider22:2340<0,4095,1>V3 Sieve Mask (mod3 res2)
+slider23:8<1,16,1>V3 Euclid Steps
+slider24:5<0,16,1>V3 Euclid Pulses
+slider25:0.75<0,1,0.01>V3 Base Probability
+
+slider26:4<1,16,1>V4 MIDI Channel
+slider27:55<0,127,1>V4 Register Low
+slider28:79<0,127,1>V4 Register High
+slider29:1365<0,4095,1>V4 Sieve Mask (whole-tone A)
+slider30:8<1,16,1>V4 Euclid Steps
+slider31:5<0,16,1>V4 Euclid Pulses
+slider32:0.7<0,1,0.01>V4 Base Probability
+
+slider33:5<1,16,1>V5 MIDI Channel
+slider34:50<0,127,1>V5 Register Low
+slider35:74<0,127,1>V5 Register High
+slider36:2730<0,4095,1>V5 Sieve Mask (whole-tone B)
+slider37:8<1,16,1>V5 Euclid Steps
+slider38:4<0,16,1>V5 Euclid Pulses
+slider39:0.65<0,1,0.01>V5 Base Probability
+
+slider40:6<1,16,1>V6 MIDI Channel
+slider41:60<0,127,1>V6 Register Low
+slider42:84<0,127,1>V6 Register High
+slider43:4095<0,4095,1>V6 Sieve Mask (chromatic)
+slider44:8<1,16,1>V6 Euclid Steps
+slider45:6<0,16,1>V6 Euclid Pulses
+slider46:0.55<0,1,0.01>V6 Base Probability
+
+slider47:7<1,16,1>V7 MIDI Channel
+slider48:72<0,127,1>V7 Register Low
+slider49:96<0,127,1>V7 Register High
+slider50:4095<0,4095,1>V7 Sieve Mask (chromatic)
+slider51:8<1,16,1>V7 Euclid Steps
+slider52:5<0,16,1>V7 Euclid Pulses
+slider53:0.45<0,1,0.01>V7 Base Probability
+
+slider54:8<1,16,1>V8 MIDI Channel
+slider55:84<0,127,1>V8 Register Low
+slider56:108<0,127,1>V8 Register High
+slider57:2184<0,4095,1>V8 Sieve Mask (mod4 res3, sparse)
+slider58:8<1,16,1>V8 Euclid Steps
+slider59:3<0,16,1>V8 Euclid Pulses
+slider60:0.35<0,1,0.01>V8 Base Probability
+
+// ── init ────────────────────────────────────────────────────────────────
+
+@init
+
+// -- functions (must live inside a section to actually compile) ---------
+
+function euclid_build(v, steps, pulses)
+local(i, cf, pf, n, k)
+(
+  n = max(1, min(16, floor(steps)));
+  k = max(0, min(n, floor(pulses)));
+  pf = -1;
+  i = 0;
+  loop(n,
+    cf = floor(i * k / n);
+    euclid_pat[v*16 + i] = (cf != pf) ? 1 : 0;
+    pf = cf;
+    i += 1;
+  );
+  i = n;
+  loop(16 - n,
+    euclid_pat[v*16 + i] = 0;
+    i += 1;
+  );
+);
+
+function eelrand()
+(
+  rng_state = (rng_state * 1103515245 + 12345) & 0x7FFFFFFF;
+  rng_state / 2147483647;
+);
+
+function gauss()
+(
+  sqrt(-2 * log(max(eelrand(), 0.0000001))) * cos(2 * 3.14159265358979 * eelrand());
+);
+
+function draw_voice(v, y, h)
+local(base, ch, rlo, rhi, smask, x0, x1, flash, bri, pc, xx)
+(
+  base = 5 + v*7;
+  ch    = floor(slider(base));
+  rlo   = slider(base+1);
+  rhi   = slider(base+2);
+  smask = floor(slider(base+3));
+
+  flash = flash_mem[v];
+  flash > 0 ? flash_mem[v] = flash - 1;
+  bri = min(1, flash / 12);
+
+  x0 = 70 + rlo * 3.0;
+  x1 = 70 + rhi * 3.0;
+
+  gfx_set(0.15 + 0.10*bri, 0.35 + 0.50*bri, 0.55 + 0.35*bri, 1);
+  gfx_rect(x0, y, max(2, x1 - x0), h - 4);
+
+  gfx_set(0.75, 0.75, 0.8, 1);
+  gfx_x = 8; gfx_y = y + h*0.5 - 6;
+  sprintf(#lbl, "V%d ch%d", v+1, ch);
+  gfx_drawstr(#lbl);
+
+  pc = 0;
+  loop(12,
+    xx = 470 + pc*11;
+    ((smask >> pc) & 1) ? gfx_set(0.9, 0.75, 0.3, 1) : gfx_set(0.22, 0.22, 0.26, 1);
+    gfx_circle(xx, y + h*0.5, 4, 1, 1);
+    pc += 1;
+  );
+);
+
+// -- memory layout & state ------------------------------------------------
+
+freemem   = 0;
+euclid_pat = freemem; freemem += 128;   // 8 voices * 16 steps
+step_ptr   = freemem; freemem += 8;     // per-voice euclid step position
+note_map   = freemem; freemem += 1024;  // 128 input notes * 8 voices -> out note (-1 = off)
+flash_mem  = freemem; freemem += 8;     // per-voice GUI flash counter
+
+rng_state = max(1, floor(seed));
+
+i = 0;
+loop(1024, note_map[i] = -1; i += 1;);
+v = 0;
+loop(8,
+  base = 5 + v*7;
+  euclid_build(v, slider(base+4), slider(base+5));
+  step_ptr[v] = 0;
+  flash_mem[v] = 0;
+  v += 1;
+);
+
+// ── slider change ─────────────────────────────────────────────────────
+
+@slider
+
+v = 0;
+loop(8,
+  base = 5 + v*7;
+  euclid_build(v, slider(base+4), slider(base+5));
+  v += 1;
+);
+
+// ── block: MIDI processing ──────────────────────────────────────────────
+
+@block
+
+while (midirecv(offset, msg1, msg23)) (
+
+  status = msg1 & 0xF0;
+  data1  = msg23 & 0x7F;
+  data2  = (msg23 >> 8) & 0x7F;
+
+  is_noteon  = (status == 0x90) && (data2 > 0);
+  is_noteoff = (status == 0x80) || (status == 0x90 && data2 == 0);
+  is_reset   = (status == 0xB0) && (data1 == 123 || data1 == 120);
+
+  is_noteon ? (
+    pc  = data1 % 12;
+    count = 0;
+    maxv = max_voices;
+    v = 0;
+    loop(8,
+      base   = 5 + v*7;
+      ch     = slider(base);
+      rlo    = slider(base+1);
+      rhi    = slider(base+2);
+      smask  = floor(slider(base+3));
+      esteps = slider(base+4);
+      bprob  = slider(base+6);
+
+      sieve_ok = (smask >> pc) & 1;
+
+      st = step_ptr[v] % max(1, floor(esteps));
+      gatebit = euclid_pat[v*16 + st];
+      step_ptr[v] = step_ptr[v] + 1;
+
+      eff_prob = bprob * (0.1 + 0.9 * entropy);
+      fires = sieve_ok && gatebit && (count < maxv) && (eelrand() < eff_prob);
+
+      fires ? (
+        center = (rlo + rhi) * 0.5;
+        target = center + gauss() * jitter;
+        target = max(rlo, min(rhi, target));
+
+        outnote = pc + 12 * floor((target - pc) / 12 + 0.5);
+        outnote < rlo ? outnote += 12;
+        outnote > rhi ? outnote -= 12;
+        outnote = max(0, min(127, max(rlo, min(rhi, outnote))));
+
+        outvel = data2 * (0.55 + 0.45 * eelrand());
+        outvel = max(1, min(127, floor(outvel + 0.5)));
+
+        note_map[data1*8 + v] = outnote;
+        midisend(offset, 0x90 | ((floor(ch) - 1) & 0x0F), outnote | (outvel << 8));
+        flash_mem[v] = 20;
+        count += 1;
+      ) : (
+        note_map[data1*8 + v] = -1;
+      );
+
+      v += 1;
+    );
+  );
+
+  is_noteoff ? (
+    v = 0;
+    loop(8,
+      base = 5 + v*7;
+      ch = slider(base);
+      on = note_map[data1*8 + v];
+      on >= 0 ? (
+        midisend(offset, 0x80 | ((floor(ch) - 1) & 0x0F), on | (0 << 8));
+        note_map[data1*8 + v] = -1;
+      );
+      v += 1;
+    );
+  );
+
+  is_reset ? (
+    i = 0;
+    loop(1024, note_map[i] = -1; i += 1;);
+  );
+
+  (!is_noteon && !is_noteoff) ? (
+    midisend(offset, msg1, msg23);
+  );
+
+);
+
+// ── gfx: register bands + live sieve display ────────────────────────────
+
+@gfx 640 300
+
+gfx_set(0.05, 0.05, 0.07, 1);
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+gfx_set(0.85, 0.85, 0.9, 1);
+gfx_x = 8; gfx_y = 6;
+sprintf(#hdr, "ORCHESTRATOR - entropy %.2f | max voices %d | jitter %.1f", entropy, max_voices, jitter);
+gfx_drawstr(#hdr);
+
+v = 0;
+loop(8,
+  draw_voice(v, 24 + v*32, 30);
+  v += 1;
+);

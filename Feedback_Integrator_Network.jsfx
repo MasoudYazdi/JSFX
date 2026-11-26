@@ -1,0 +1,685 @@
+desc:Feedback Integrator Network (notational GUI)
+tags:synthesis feedback generative
+in_pin:In L
+in_pin:In R
+out_pin:Out L
+out_pin:Out R
+
+slider1:8<2,12,1>Nodes
+slider2:110<20,800,1>Base Freq (Hz)
+slider3:4<0.5,7,0.01>Octave Span (Even/Golden/Random)
+slider4:0<0,4,1{Even,Harmonic,Golden,Sieve,Random}>Pitch Layout
+slider5:0<0,5,1{Ring Rotor,Coupled Pairs,Cascade Chain,Antisym Random,Small World,Sieve Graph}>Topology
+slider6:0.2<0,1,0.01>Symmetry (0 rotor - 1 reciprocal)
+slider7:1.6<0,4,0.01>Feedback Gain
+slider8:0.12<0.01,2,0.01>Leak (Damping)
+slider9:1.5<0.2,6,0.01>Saturation Drive
+slider10:0.07<-1,1,0.01>Self Coupling
+slider11:0.3<0,2,0.01>Input Injection
+slider12:0.4<-1,1,0.01>Input Envelope -> Feedback
+slider13:0.3<0,1,0.01>Seed Noise
+slider14:0.2<0,1,0.01>Mutation
+slider15:7<1,9999,1>Random Seed
+slider16:0.7<0,1,0.01>Stereo Width
+slider17:0.6<0,2,0.01>Output Level
+slider18:1<0,1,0.01>Wet Mix
+slider19:8<2,30,0.5>Score Window (s)
+slider20:0<0,1,1{Live,Frozen}>Score
+slider21:0<0,1,1{-,Reset}>Reset States
+
+@init
+ext_noinit = 1;
+LN2 = log(2);
+L440 = log(440)/LN2;
+TK = 16;
+H = 400;
+
+// ---- memory map ----
+mP=0; mWc=288; mM=432; mE=576;
+mY=720; mS=732; mG=744; mLF=756; mLFT=768; mAct=780; mActT=792;
+mPanL=804; mPanR=816; mMute=828; mMuteT=840; mAcc=852; mD=864;
+mFE=876; mCnt=888; mArm=900; mPk=912; mNX=924; mNY=936;
+rngA=950; rngB=951; rngM=952;
+mHistA=1000; mHistP=1000+12*H;
+memset(0,0,12000);
+rngA[0]=48271; rngB[0]=777; rngM[0]=31337;
+
+// ---- functions (all declared in @init) ----
+function lcgn(a) (
+  lt = a[0]*1664525 + 1013904223;
+  a[0] = lt - floor(lt/4294967296)*4294967296;
+  a[0]/4294967296;
+);
+
+function sat(x) (
+  x > 3 ? 1 : (x < -3 ? -1 : x*(27+x*x)/(27+9*x*x));
+);
+
+function setcol(h,s,v,a) (
+  h = (h - floor(h))*6;
+  sci = floor(h); scf = h - sci;
+  scp = v*(1-s); scq = v*(1-s*scf); sct = v*(1-s*(1-scf));
+  sci==0 ? (scr=v; scg=sct; scb=scp;) :
+  sci==1 ? (scr=scq; scg=v; scb=scp;) :
+  sci==2 ? (scr=scp; scg=v; scb=sct;) :
+  sci==3 ? (scr=scp; scg=scq; scb=v;) :
+  sci==4 ? (scr=sct; scg=scp; scb=v;) :
+           (scr=v; scg=scp; scb=scq;);
+  gfx_set(scr,scg,scb,a);
+);
+
+function btn(x,y,bw,bh,lbl,on) (
+  bthot = mouse_x>=x && mouse_x<x+bw && mouse_y>=y && mouse_y<y+bh;
+  on ? gfx_set(0.15,0.14,0.13,1) : (bthot ? gfx_set(0.82,0.8,0.74,1) : gfx_set(0.88,0.86,0.8,1));
+  gfx_rect(x,y,bw,bh);
+  gfx_set(0.1,0.09,0.08,1);
+  gfx_rect(x,y,bw,bh,0);
+  on ? gfx_set(0.93,0.91,0.86,1) : gfx_set(0.1,0.09,0.08,1);
+  gfx_measurestr(lbl,btw,bth2);
+  gfx_x = x+(bw-btw)*0.5; gfx_y = y+(bh-bth2)*0.5;
+  gfx_drawstr(lbl);
+  bthot && mClick;
+);
+
+function buildP() (
+  bN = nN; btp = slider5;
+  memset(mP,0,144);
+  rngB[0] = slider15*7919 + 17;
+  // ring rotor
+  btp==0 ? (
+    bi=0; loop(bN, (bN>2 || bi==0) ? ( mP[bi*12+(bi+1)%bN] = 1; ); bi+=1; );
+  );
+  // coupled pairs
+  btp==1 ? (
+    bi=0;
+    loop(bN,
+      (bi%2==0 && bi+1<bN) ? ( mP[bi*12+bi+1] = 1; );
+      (bi%2==1 && bi+1<bN) ? ( mP[(bi+1)*12+bi] = 0.4; );
+      bi+=1;
+    );
+  );
+  // cascade chain with closing feedback
+  btp==2 ? (
+    bi=1; loop(bN-1, mP[bi*12+bi-1] = 1; bi+=1; );
+    mP[bN-1] = 0.6;
+  );
+  // sparse antisymmetric random
+  btp==3 ? (
+    bi=0;
+    loop(bN,
+      bj=bi+1;
+      loop(bN-bi-1,
+        br = lcgn(rngB); bv = lcgn(rngB);
+        br < 0.6 ? ( mP[bi*12+bj] = (bv<0.5 ? -1 : 1)*(0.4+lcgn(rngB)*0.6); );
+        bj+=1;
+      );
+      bi+=1;
+    );
+    bN>2 ? ( bi=0; loop(bN, mP[bi*12+(bi+1)%bN] += 0.25; bi+=1; ); );
+  );
+  // small world: ring + random shortcuts
+  btp==4 ? (
+    bi=0; loop(bN, (bN>2 || bi==0) ? ( mP[bi*12+(bi+1)%bN] = 1; ); bi+=1; );
+    bk=0;
+    loop(max(2,floor(bN*0.7)),
+      bi = floor(lcgn(rngB)*bN); bj = floor(lcgn(rngB)*bN);
+      bi != bj ? ( mP[bi*12+bj] = (lcgn(rngB)<0.5 ? -0.9 : 0.9); );
+      bk+=1;
+    );
+  );
+  // sieve graph: link i<-j where (j-i) in 3(0) U 5(2)
+  btp==5 ? (
+    bi=0;
+    loop(bN,
+      bj=bi+1;
+      loop(bN-bi-1,
+        bd = bj-bi;
+        ((bd%3==0) || (bd%5==2)) ? ( mP[bi*12+bj] = 1; );
+        bj+=1;
+      );
+      bi+=1;
+    );
+    bi=0; loop(bN-1, mP[bi*12+bi+1] = max(mP[bi*12+bi+1],0.35); bi+=1; );
+  );
+);
+
+function layoutTargets() (
+  ltN = nN; ltBase = log(slider2)/LN2; ltSpan = slider3; ltLay = slider4;
+  rngB[0] = slider15*104729 + 3;
+  ltLo = log(15)/LN2; ltHi = log(srate*0.06)/LN2;
+  lti = 0; ltM = 0;
+  loop(12,
+    ltLay==0 ? ( ltO = (ltN>1 ? lti*ltSpan/(ltN-1) : 0); ) :
+    ltLay==1 ? ( ltO = log(lti+1)/LN2; ) :
+    ltLay==2 ? ( ltO = lti*0.6180339887; ltO -= floor(ltO); ltO *= ltSpan; ) :
+    ltLay==3 ? (
+      while ( !((ltM%3==0) || (ltM%7==2)) ) ( ltM += 1; );
+      ltO = ltM/12; ltM += 1;
+    ) : ( ltO = lcgn(rngB)*ltSpan; );
+    ltV = ltBase + ltO;
+    mLFT[lti] = min(ltHi,max(ltLo,ltV));
+    lti += 1;
+  );
+);
+
+function resetStates() (
+  ri = 0;
+  loop(12,
+    mY[ri] = (lcgn(rngB)*2-1)*0.15;
+    mS[ri] = 0; mArm[ri] = 0; mCnt[ri] = 0;
+    mFE[ri] = mLF[ri]; mAcc[ri] = 0; mPk[ri] = 0;
+    ri += 1;
+  );
+  memset(mM,0,144);
+  dxL = 0; dyL = 0; dxR = 0; dyR = 0;
+);
+
+function controlTick() (
+  selfS += kt*(slider10-selfS);
+  symS  += kt*(slider6-symS);
+  wdS   += kt*(slider16-wdS);
+  mutS  += kt*(slider14-mutS);
+  csum = 0; ci = 0;
+  loop(12,
+    ca = mAct[ci]; ca += kt*(mActT[ci]-ca); mAct[ci] = ca; csum += ca;
+    mLF[ci] += kF*(mLFT[ci]-mLF[ci]);
+    cf = exp(mLF[ci]*LN2);
+    cg = min(0.45, 2*sin($pi*cf/srate));
+    mG[ci] = cg;
+    mD[ci] = leakS + (1-ca)*3;
+    mMute[ci] += kt*(mMuteT[ci]-mMute[ci]);
+    cp = ci*0.6180339887 + 0.17; cp -= floor(cp);
+    cp = 0.5 + wdS*(cp-0.5);
+    mPanL[ci] = cos(cp*$pi*0.5);
+    mPanR[ci] = sin(cp*$pi*0.5);
+    mCnt[ci] > srate*0.3 ? ( mFE[ci] += kF*(mLF[ci]-mFE[ci]); );
+    ci += 1;
+  );
+  gnorm = 1/sqrt(max(1,csum));
+
+  // mutation: slow random walk of coupling weights
+  mutS > 0.001 ? (
+    ck = min(143,floor(lcgn(rngM)*144));
+    (ck%13 != 0) ? (
+      mM[ck] = min(1.2,max(-1.2, mM[ck] + (lcgn(rngM)*2-1)*0.12*mutS));
+    );
+  );
+  decayCnt += 1;
+  decayCnt > 160 ? ( decayCnt = 0; ck = 0; loop(144, mM[ck] *= 0.985; ck += 1; ); );
+
+  // weight morph (topology / symmetry / edits crossfade)
+  ci = 0;
+  loop(12,
+    cj = 0;
+    loop(12,
+      cidx = ci*12+cj;
+      ci==cj ? (
+        ct = selfS + mE[cidx];
+      ) : (
+        cpij = mP[cidx]; cpji = mP[cj*12+ci];
+        cpa = (cpij-cpji)*0.5; cps = (cpij+cpji)*0.5;
+        ct = 2*((1-symS)*cpa + symS*cps) + mM[cidx] + mE[cidx];
+      );
+      ct = min(3,max(-3,ct));
+      mWc[cidx] += kW*(ct-mWc[cidx]);
+      cj += 1;
+    );
+    ci += 1;
+  );
+);
+
+// ---- state ----
+nN = 8;
+i = 0;
+loop(12,
+  mActT[i] = (i<8); mAct[i] = mActT[i];
+  mMute[i] = 1; mMuteT[i] = 1;
+  mLF[i] = log(110)/LN2; mLFT[i] = mLF[i]; mG[i] = 0.01;
+  i += 1;
+);
+ks = 1-exp(-1/(0.02*srate));
+kt = 1-exp(-TK/(0.08*srate));
+kF = 1-exp(-TK/(0.15*srate));
+kW = 1-exp(-TK/(0.3*srate));
+envAtt = 1-exp(-1/(0.005*srate));
+envRel = 1-exp(-1/(0.2*srate));
+pkDec = exp(-1/(0.06*srate));
+fbS=slider7; drvS=slider9; leakS=slider8; injS=slider11; outS=slider17; mixS=slider18;
+eaS=slider12; nzS=slider13; selfS=slider10; symS=slider6; wdS=slider16; mutS=slider14;
+envF = 0; gnorm = 1; tk = 0; decayCnt = 0;
+head = 0; colC = 0; colCount = 0; colSamples = 1000;
+lastRst = slider21; doReset = 0; doClear = 0;
+axLo = 5.9; axHi = 10; uselC = -1; mDownPrev = 0; ulMY = 0;
+resetStates();
+
+@slider
+nN = max(2,min(12,floor(slider1+0.5)));
+i = 0; loop(12, mActT[i] = (i<nN); i+=1; );
+buildP();
+layoutTargets();
+
+@block
+slider21 != lastRst ? ( lastRst = slider21; doReset = 1; );
+doReset ? ( resetStates(); doReset = 0; );
+doClear ? ( memset(mHistA,0,12*H); memset(mHistP,0,12*H); doClear = 0; );
+colSamples = max(8, slider19*srate/H);
+
+@serialize
+file_mem(0,mE,144);
+file_mem(0,mMuteT,12);
+
+@sample
+fbS += ks*(slider7-fbS);
+drvS += ks*(slider9-drvS);
+leakS += ks*(slider8-leakS);
+injS += ks*(slider11-injS);
+outS += ks*(slider17-outS);
+mixS += ks*(slider18-mixS);
+eaS += ks*(slider12-eaS);
+nzS += ks*(slider13-nzS);
+
+tk -= 1;
+tk <= 0 ? ( tk = TK; controlTick(); );
+
+inM = (spl0+spl1)*0.5;
+!(abs(inM) < 8) ? ( inM = 0; );
+aIn = abs(inM);
+envF += (aIn > envF ? envAtt : envRel)*(aIn-envF);
+fbE = max(0, fbS*(1 - eaS*min(1,envF*4)));
+nzA = nzS*0.01;
+
+// Gauss-Seidel sweep over the integrator network
+n_i = 0; wetL = 0; wetR = 0;
+loop(12,
+  n_row = mWc + n_i*12;
+  n_acc = 0; n_j = 0;
+  loop(12, n_acc += n_row[n_j]*mS[n_j]; n_j += 1; );
+  n_y = mY[n_i];
+  n_y += mG[n_i]*( fbE*n_acc + injS*inM*mAct[n_i] + (lcgn(rngA)*2-1)*nzA - mD[n_i]*n_y );
+  n_ay = abs(n_y);
+  !(n_ay < 1000000) ? ( n_y = 0; n_ay = 0; );
+  n_ay > 3 ? (
+    n_e = n_ay-3;
+    n_y = (n_y < 0 ? -1 : 1)*(3 + n_e/(1+n_e));
+    n_ay = abs(n_y);
+  );
+  mY[n_i] = n_y;
+  mS[n_i] = sat(drvS*n_y)*mAct[n_i];
+
+  // zero-crossing pitch measurement
+  n_cnt = mCnt[n_i] + 1; n_arm = mArm[n_i];
+  (n_arm == 0 && n_y < -0.05) ? ( n_arm = 1; );
+  (n_arm == 1 && n_y > 0.05) ? (
+    n_per = n_cnt; n_cnt = 0; n_arm = 0;
+    n_per > 6 ? ( mFE[n_i] += 0.5*(log(srate/n_per)/LN2 - mFE[n_i]); );
+  );
+  n_cnt > srate*2 ? ( n_cnt = srate*2; );
+  mCnt[n_i] = n_cnt; mArm[n_i] = n_arm;
+
+  // amplitude tracking (score + dynamics)
+  n_ay *= mAct[n_i];
+  n_ay > mAcc[n_i] ? ( mAcc[n_i] = n_ay; );
+  n_pk = mPk[n_i]*pkDec;
+  mPk[n_i] = (n_ay > n_pk ? n_ay : n_pk);
+
+  n_o = mS[n_i]*mMute[n_i];
+  wetL += n_o*mPanL[n_i];
+  wetR += n_o*mPanR[n_i];
+  n_i += 1;
+);
+
+hL = wetL*gnorm*outS; hR = wetR*gnorm*outS;
+oL = hL - dxL + 0.9995*dyL; dxL = hL; dyL = oL;
+oR = hR - dxR + 0.9995*dyR; dxR = hR; dyR = oR;
+!(abs(oL) < 40 && abs(oR) < 40) ? ( resetStates(); oL = 0; oR = 0; );
+
+spl0 = spl0*(1-mixS) + sat(oL)*mixS;
+spl1 = spl1*(1-mixS) + sat(oR)*mixS;
+
+// score column recorder
+slider20 < 0.5 ? (
+  colC += 1;
+  colC >= colSamples ? (
+    colC -= colSamples;
+    head = (head+1)%H; colCount += 1;
+    n_k = 0;
+    loop(12,
+      mHistA[n_k*H+head] = mAcc[n_k];
+      mHistP[n_k*H+head] = mFE[n_k];
+      mAcc[n_k] = 0;
+      n_k += 1;
+    );
+  );
+);
+
+@gfx 1000 580
+gfx_setfont(2,"Arial",18,'b');
+gfx_setfont(3,"Times New Roman",15,'i');
+gfx_setfont(4,"Arial",10);
+gfx_setfont(1,"Arial",12);
+uw = gfx_w; uh = gfx_h; mg = 10; HH = 38;
+un = nN;
+mDown = mouse_cap&1;
+mClick = mDown && !mDownPrev;
+LW = min(max(250,uw*0.3),360);
+
+// paper
+gfx_set(0.925,0.905,0.855,1);
+gfx_rect(0,0,uw,uh);
+
+// ---------------- header ----------------
+slider5==0 ? strcpy(#utn,"ring rotor");
+slider5==1 ? strcpy(#utn,"coupled pairs");
+slider5==2 ? strcpy(#utn,"cascade chain");
+slider5==3 ? strcpy(#utn,"antisym random");
+slider5==4 ? strcpy(#utn,"small world");
+slider5==5 ? strcpy(#utn,"sieve graph");
+slider4==0 ? strcpy(#uln,"even");
+slider4==1 ? strcpy(#uln,"harmonic");
+slider4==2 ? strcpy(#uln,"golden");
+slider4==3 ? strcpy(#uln,"sieve");
+slider4==4 ? strcpy(#uln,"random");
+gfx_set(0.1,0.09,0.08,1);
+gfx_setfont(2);
+gfx_x = mg; gfx_y = 9;
+gfx_drawstr("Feedback Integrator Network");
+gfx_measurestr("Feedback Integrator Network",utw,uth);
+gfx_setfont(1);
+sprintf(#usub,"%d nodes  |  %s  |  rates: %s",un,#utn,#uln);
+gfx_set(0.1,0.09,0.08,0.65);
+gfx_x = mg+utw+16; gfx_y = 13;
+gfx_drawstr(#usub);
+
+btn(uw-mg-186,9,58,20,"Reset",0) ? ( doReset = 1; );
+btn(uw-mg-124,9,58,20,"Clear",0) ? ( doClear = 1; );
+btn(uw-mg-62,9,62,20,"Freeze",slider20>0.5) ? (
+  slider20 = 1-slider20;
+  sliderchange(slider20);
+  slider_automate(slider20);
+);
+
+// ---------------- network diagram ----------------
+ucs = floor(min(18,(LW-2*mg-16)/un));
+umx = ucs*un+16;
+udS = max(130,min(LW-2*mg,uh-HH-3*mg-22-umx));
+ucx = mg+(LW-2*mg)*0.5; ucy = HH+mg+udS*0.5;
+uR = max(30,udS*0.5-24);
+gfx_set(0.965,0.95,0.9,1);
+gfx_rect(mg,HH+mg,LW-2*mg,udS);
+gfx_set(0.1,0.09,0.08,0.8);
+gfx_rect(mg,HH+mg,LW-2*mg,udS,0);
+
+ui = 0;
+loop(un,
+  uang = -$pi*0.5 + 2*$pi*ui/un;
+  mNX[ui] = ucx + uR*cos(uang);
+  mNY[ui] = ucy + uR*sin(uang);
+  ui += 1;
+);
+
+// edges: W[i<-j] drawn from node j to node i
+ui = 0;
+loop(un,
+  uj = 0;
+  loop(un,
+    ui != uj ? (
+      uwv = mWc[ui*12+uj]; uaw = abs(uwv);
+      uaw > 0.07 ? (
+        udx = mNX[ui]-mNX[uj]; udy = mNY[ui]-mNY[uj];
+        ul = sqrt(udx*udx+udy*udy)+0.0001;
+        udx /= ul; udy /= ul;
+        upx = -udy; upy = udx;
+        uwv > 0 ? gfx_set(0.12,0.27,0.55,min(1,0.3+uaw*0.4)) : gfx_set(0.72,0.15,0.1,min(1,0.3+uaw*0.4));
+        usx = mNX[uj]+udx*12+upx*3; usy = mNY[uj]+udy*12+upy*3;
+        uex = mNX[ui]-udx*15+upx*3; uey = mNY[ui]-udy*15+upy*3;
+        ut = 1+floor(min(uaw,3)*0.8);
+        uk = 0;
+        loop(ut,
+          uo = uk-(ut-1)*0.5;
+          gfx_line(usx+upx*uo,usy+upy*uo,uex+upx*uo,uey+upy*uo,1);
+          uk += 1;
+        );
+        gfx_triangle(uex+udx*6,uey+udy*6, uex+upx*3,uey+upy*3, uex-upx*3,uey-upy*3);
+      );
+    );
+    uj += 1;
+  );
+  ui += 1;
+);
+
+// nodes
+ui = 0;
+loop(un,
+  ur = 6+9*sqrt(min(1,mPk[ui]/2.2));
+  setcol(ui/12*0.85+0.02,0.6,0.42,1);
+  mMuteT[ui] > 0.5 ? (
+    gfx_circle(mNX[ui],mNY[ui],ur,1,1);
+  ) : (
+    gfx_circle(mNX[ui],mNY[ui],ur,0,1);
+    gfx_circle(mNX[ui],mNY[ui],ur-1,0,1);
+  );
+  gfx_set(0.1,0.09,0.08,1);
+  gfx_circle(mNX[ui],mNY[ui],ur+1,0,1);
+  sprintf(#unum,"%d",ui+1);
+  gfx_setfont(4);
+  gfx_measurestr(#unum,utw,uth);
+  udx = (mNX[ui]-ucx)/uR; udy = (mNY[ui]-ucy)/uR;
+  gfx_x = mNX[ui]+udx*(ur+9)-utw*0.5;
+  gfx_y = mNY[ui]+udy*(ur+9)-uth*0.5;
+  gfx_drawstr(#unum);
+  gfx_setfont(1);
+  (mClick && sqrt((mouse_x-mNX[ui])*(mouse_x-mNX[ui])+(mouse_y-mNY[ui])*(mouse_y-mNY[ui])) < ur+4) ? (
+    mMuteT[ui] = 1-mMuteT[ui];
+  );
+  ui += 1;
+);
+
+// ---------------- coupling matrix (editable) ----------------
+ugx = mg+16; ugy = HH+mg+udS+22;
+gfx_setfont(4);
+gfx_set(0.1,0.09,0.08,0.7);
+gfx_x = ugx; gfx_y = ugy-22;
+gfx_drawstr("coupling W[to<-from]   drag = edit, ctrl-click = clear");
+ui = 0;
+loop(un,
+  sprintf(#unum,"%d",ui+1);
+  gfx_x = ugx+ui*ucs+ucs*0.3; gfx_y = ugy-11; gfx_drawstr(#unum);
+  gfx_x = ugx-13; gfx_y = ugy+ui*ucs+ucs*0.15; gfx_drawstr(#unum);
+  ui += 1;
+);
+
+uhv = -1;
+umxx = mouse_x-ugx; umyy = mouse_y-ugy;
+(umxx >= 0 && umyy >= 0 && umxx < ucs*un && umyy < ucs*un) ? (
+  uhv = floor(umyy/ucs)*12 + floor(umxx/ucs);
+);
+(mClick && uhv >= 0) ? (
+  (mouse_cap&36) ? ( mE[uhv] = 0; uselC = -1; ) : ( uselC = uhv; );
+);
+(mDown && uselC >= 0) ? (
+  mE[uselC] = min(2.5,max(-2.5, mE[uselC] + (ulMY-mouse_y)*0.012));
+);
+!mDown ? ( uselC = -1; );
+
+ui = 0;
+loop(un,
+  uj = 0;
+  loop(un,
+    uidx = ui*12+uj;
+    ux0 = ugx+uj*ucs; uy0 = ugy+ui*ucs;
+    gfx_set(0.1,0.09,0.08,0.12);
+    gfx_rect(ux0,uy0,ucs,ucs,0);
+    uwv = mWc[uidx]; uaw = abs(uwv);
+    usz = min(ucs-2,uaw/1.5*(ucs-2));
+    usz > 0.8 ? (
+      uwv > 0 ? gfx_set(0.12,0.27,0.55,0.9) : gfx_set(0.72,0.15,0.1,0.9);
+      ui == uj ? gfx_circle(ux0+ucs*0.5,uy0+ucs*0.5,usz*0.5,1,1) : gfx_rect(ux0+(ucs-usz)*0.5,uy0+(ucs-usz)*0.5,usz,usz);
+    );
+    mE[uidx] != 0 ? ( gfx_set(0.1,0.09,0.08,0.9); gfx_rect(ux0+1,uy0+1,3,3); );
+    uj += 1;
+  );
+  ui += 1;
+);
+gfx_set(0.1,0.09,0.08,0.7);
+gfx_rect(ugx,ugy,ucs*un,ucs*un,0);
+
+(uhv >= 0 || uselC >= 0) ? (
+  uq = (uselC >= 0 ? uselC : uhv);
+  sprintf(#utt,"W[%d<-%d] = %.2f   edit %.2f",floor(uq/12)+1,uq%12+1,mWc[uq],mE[uq]);
+) : (
+  strcpy(#utt,"click a node to mute / unmute it");
+);
+gfx_set(0.1,0.09,0.08,0.8);
+gfx_x = mg+5; gfx_y = HH+mg+udS-14;
+gfx_drawstr(#utt);
+gfx_setfont(1);
+
+// ---------------- notational score ----------------
+usx0 = LW+mg; ulabW = 122;
+usx1 = uw-mg-ulabW; usy0 = HH+mg; usy1 = uh-mg-18;
+usw = usx1-usx0; ush = usy1-usy0;
+(usw > 60 && ush > 60) ? (
+  gfx_set(0.975,0.96,0.915,1);
+  gfx_rect(usx0,usy0,usw,ush);
+
+  // auto pitch axis from measured node pitches
+  utlo = 1000; uthi = -1000;
+  ui = 0;
+  loop(un, utlo = min(utlo,mFE[ui]); uthi = max(uthi,mFE[ui]); ui += 1; );
+  utlo -= 0.7; uthi += 0.7;
+  (uthi-utlo < 3) ? ( uc = (uthi+utlo)*0.5; utlo = uc-1.5; uthi = uc+1.5; );
+  axLo += 0.08*(utlo-axLo); axHi += 0.08*(uthi-axHi);
+  uspan = axHi-axLo;
+
+  // pitch staff
+  umLo = 69+12*(axLo-L440); umHi = 69+12*(axHi-L440);
+  upps = ush/(umHi-umLo);
+  uk = floor(umLo);
+  loop(min(300,ceil(umHi)-floor(umLo)+1),
+    uyy = usy1-((L440+(uk-69)/12)-axLo)/uspan*ush;
+    (uyy >= usy0 && uyy <= usy1) ? (
+      upc = ((uk%12)+12)%12;
+      ustaff = (uk==64||uk==67||uk==71||uk==74||uk==77||uk==43||uk==47||uk==50||uk==53||uk==57);
+      ustaff ? (
+        gfx_set(0.1,0.09,0.08,0.45);
+        gfx_line(usx0,uyy,usx1,uyy,0);
+      ) : (
+        upps >= 5 ? (
+          gfx_set(0.1,0.09,0.08,0.07);
+          gfx_line(usx0,uyy,usx1,uyy,0);
+        );
+      );
+      upc == 0 ? (
+        gfx_set(0.1,0.09,0.08,0.22);
+        gfx_line(usx0,uyy,usx1,uyy,0);
+        sprintf(#ulb,"C%d",floor(uk/12)-1);
+        gfx_setfont(4);
+        gfx_set(0.1,0.09,0.08,0.55);
+        gfx_x = usx0+3; gfx_y = uyy-11;
+        gfx_drawstr(#ulb);
+        gfx_setfont(1);
+      );
+    );
+    uk += 1;
+  );
+
+  // time bar lines (1 s)
+  ubc = max(1,floor(H/slider19+0.5));
+  ucw = usw/H;
+  uk = 0;
+  loop(H,
+    ugi = colCount-(H-1-uk);
+    (ugi > 0 && ugi%ubc == 0) ? (
+      ux = usx0+uk*ucw;
+      gfx_set(0.1,0.09,0.08,(ugi%(ubc*4)==0 ? 0.35 : 0.14));
+      gfx_line(ux,usy0,ux,usy1,0);
+      (ugi%(ubc*4)==0) ? (
+        sprintf(#ult,"%ds",ugi/ubc);
+        gfx_setfont(4);
+        gfx_x = ux+2; gfx_y = usy0+2;
+        gfx_drawstr(#ult);
+        gfx_setfont(1);
+      );
+    );
+    uk += 1;
+  );
+
+  // glyph ribbons: height = measured pitch, thickness = amplitude, notehead = onset
+  uhm = max(3,min(12,ush*0.025));
+  ui = 0;
+  loop(12,
+    ubase = ui*H; upa = 0; uk = 0;
+    loop(H,
+      uidx = (head+1+uk)%H;
+      ua = mHistA[ubase+uidx];
+      ua > 0.012 ? (
+        up = mHistP[ubase+uidx];
+        uy = usy1-(up-axLo)/uspan*ush;
+        (uy > usy0 && uy < usy1) ? (
+          uamp = sqrt(min(1,ua/2.2));
+          uhh = 0.8+uamp*uhm;
+          setcol(ui/12*0.85+0.02,0.6,0.42,0.3+0.65*uamp);
+          gfx_rect(usx0+uk*ucw,uy-uhh,ucw+0.7,uhh*2);
+          upa <= 0.012 ? (
+            setcol(ui/12*0.85+0.02,0.6,0.3,1);
+            gfx_circle(usx0+uk*ucw,uy,3.2,1,1);
+          );
+        );
+      );
+      upa = ua;
+      uk += 1;
+    );
+    ui += 1;
+  );
+
+  gfx_set(0.1,0.09,0.08,0.9);
+  gfx_rect(usx0,usy0,usw,ush,0);
+
+  // right margin: note names + dynamics
+  urh = min(20,ush/un);
+  ui = 0;
+  loop(un,
+    uy0 = usy0+ui*urh;
+    up = mFE[ui];
+    uyp = usy1-(up-axLo)/uspan*ush;
+    uen = min(1,mPk[ui]/2.2);
+    (uen > 0.01 && uyp > usy0 && uyp < usy1) ? (
+      setcol(ui/12*0.85+0.02,0.6,0.42,0.6);
+      gfx_line(usx1,uyp,usx1+10,uy0+urh*0.5,1);
+    );
+    setcol(ui/12*0.85+0.02,0.6,0.42,(mMuteT[ui]>0.5 ? 1 : 0.3));
+    gfx_rect(usx1+11,uy0+urh*0.5-3,6,6);
+    umid = 69+12*(up-L440);
+    umr = floor(umid+0.5);
+    uct = floor((umid-umr)*100+0.5);
+    upc = ((umr%12)+12)%12;
+    uoc = floor(umr/12)-1;
+    strcpy_substr(#unm,"C C#D D#E F F#G G#A A#B ",upc*2,2);
+    str_getchar(#unm,1) == 32 ? str_setlen(#unm,1);
+    sprintf(#ulb,"%s%d %s%d",#unm,uoc,(uct>=0 ? "+" : ""),uct);
+    gfx_set(0.1,0.09,0.08,0.4+0.6*min(1,uen*4));
+    gfx_setfont(1);
+    gfx_x = usx1+22; gfx_y = uy0+urh*0.5-6;
+    gfx_drawstr(#ulb);
+    uen < 0.01 ? strcpy(#udy,"-") :
+    uen < 0.04 ? strcpy(#udy,"pp") :
+    uen < 0.1  ? strcpy(#udy,"p") :
+    uen < 0.2  ? strcpy(#udy,"mp") :
+    uen < 0.35 ? strcpy(#udy,"mf") :
+    uen < 0.55 ? strcpy(#udy,"f") : strcpy(#udy,"ff");
+    gfx_setfont(3);
+    gfx_x = usx1+88; gfx_y = uy0+urh*0.5-8;
+    gfx_drawstr(#udy);
+    gfx_setfont(1);
+    ui += 1;
+  );
+);
+
+gfx_setfont(4);
+gfx_set(0.1,0.09,0.08,0.6);
+gfx_x = LW+mg; gfx_y = uh-mg-11;
+gfx_drawstr("ribbon height = measured pitch (zero-crossing)   thickness = amplitude   notehead = onset   blue = excitatory, red = inhibitory");
+gfx_setfont(1);
+
+mDownPrev = mDown;
+ulMY = mouse_y;

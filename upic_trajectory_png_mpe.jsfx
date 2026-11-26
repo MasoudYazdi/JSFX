@@ -1,0 +1,287 @@
+desc:UPIC-style Image Trajectory (PNG scan -> Sine / MPE MIDI)
+
+slider1:npoints=400<32,1024,1>Buffer Resolution (columns)
+slider2:dur=4<0.1,30,0.01>Trajectory Duration (s)
+slider3:mode=0<0,1,1{Internal Sine,MPE MIDI Out (to VSTi)}>Sound Source
+slider4:pitchlo=48<0,127,1>Pitch Range Low (MIDI note)
+slider5:pitchhi=84<0,127,1>Pitch Range High (MIDI note)
+slider6:loop=1<0,1,1{One-shot,Loop}>Playback Mode
+slider7:thresh=128<1,254,1>Black Threshold (0-255)
+slider8:invert=0<0,1,1{Black-on-White (default),White-on-Black}>Image Polarity
+slider9:mpe_ch=2<2,15,1>MPE Member Channel
+slider10:bendrange=48<1,96,1>MPE Pitch Bend Range (semitones)
+slider11:velocity=100<1,127,1>Note Velocity
+
+@init
+
+MAXPTS = 1024;
+IMG = 1; // gfx image slot used for the loaded PNG
+
+traj  = 0; // trajectory (pitch) values 0..1, indexed via traj[i]
+dens  = 5000; // density (brightness/expression) values 0..1, indexed via dens[i]
+i = 0;
+while (i < MAXPTS) ( traj[i] = 0.5; dens[i] = 0; i += 1 );
+
+play_pos   = 0;
+osc_phase  = 0;
+img_loaded = 0;
+imgw = 0; imgh = 0;
+editing    = 0;
+do_load    = 0;
+do_rescan  = 0;
+last_npoints = npoints;
+prev_cap   = 0;
+
+note_active = 0;
+cur_note    = 60;
+ctrl_rate   = 32;   // send MPE pitch-bend/CC every N samples (control-rate, not per-sample)
+ctrl_count  = 0;
+midi_pos    = 0;
+
+path_init = 0;
+!path_init ? ( strcpy(#path, "Drop a PNG here, or click and type a path..."); path_init = 1; );
+
+function draw_point(idx, val)
+(
+  idx >= 0 && idx < npoints ? traj[idx] = max(0, min(1, val));
+);
+
+// Scans the currently loaded image (slot IMG) into traj[]/dens[].
+// White background / black drawing is the default polarity (invert=0).
+// NOTE: this walks every pixel of every scanned column once per (re)load,
+// so it can cause a brief hitch on large images - that's expected.
+function scan_image()
+(
+  imgw > 0 && imgh > 0 ? (
+    gfx_dest = IMG;
+    j = 0;
+    while (j < npoints) (
+      ix = floor(j * imgw / npoints);
+      ix = min(ix, imgw - 1);
+      found = 0;
+      blackcount = 0;
+      iy = 0;
+      while (iy < imgh) (
+        gfx_x = ix; gfx_y = iy;
+        gfx_getpixel(r, g, b);
+        lum = (r + g + b) * (255/3);
+        isblack = invert ? (lum > (255 - thresh)) : (lum < thresh);
+        isblack ? (
+          !found ? ( traj[j] = 1 - iy/imgh; found = 1; );
+          blackcount += 1;
+        );
+        iy += 1;
+      );
+      !found ? traj[j] = (j > 0 ? traj[j-1] : 0.5);
+      dens[j] = blackcount / imgh;
+      j += 1;
+    );
+    gfx_dest = -1;
+  );
+);
+
+function load_image()
+(
+  gfx_loadimg(IMG, #path);
+  gfx_getimgdim(IMG, imgw, imgh);
+  imgw > 0 && imgh > 0 ? (
+    img_loaded = 1;
+    scan_image();
+    play_pos = 0;
+  ) : (
+    img_loaded = 0;
+  );
+);
+
+@slider
+
+mode != 1 && note_active ? (
+  midisend(0, 0x80 | (mpe_ch - 1), cur_note, 0);
+  note_active = 0;
+);
+img_loaded && npoints != last_npoints ? do_rescan = 1;
+last_npoints = npoints;
+
+@gfx 640 380
+
+// --- handle drag & drop PNG ---
+drop_idx = 0;
+gfx_getdropfile(drop_idx, #dropname) ? (
+  strcpy(#path, #dropname);
+  do_load = 1;
+  drop_idx = 1;
+  while (gfx_getdropfile(drop_idx, #dropname)) ( drop_idx += 1 ); // drain queue
+  gfx_getdropfile(-1, #dropname); // clear
+);
+
+do_load   ? ( load_image(); do_load = 0; );
+do_rescan ? ( scan_image(); do_rescan = 0; );
+
+// --- background / trajectory graph ---
+gfx_clear = 0x101010;
+graph_h = gfx_h - 60;
+
+gfx_set(0.3, 0.3, 0.3, 1);
+gfx_line(0, graph_h*0.5, gfx_w, graph_h*0.5);
+
+gfx_set(0.2, 0.9, 0.6, 1);
+i = 0;
+while (i < npoints - 1) (
+  x0 = gfx_w * i/npoints;      y0 = graph_h * (1 - traj[i]);
+  x1 = gfx_w * (i+1)/npoints;  y1 = graph_h * (1 - traj[i+1]);
+  gfx_line(x0, y0, x1, y1);
+  i += 1;
+);
+
+gfx_set(0.9, 0.6, 0.2, 0.5);
+i = 0;
+while (i < npoints - 1) (
+  x0 = gfx_w * i/npoints;      y0 = graph_h * (1 - dens[i]);
+  x1 = gfx_w * (i+1)/npoints;  y1 = graph_h * (1 - dens[i+1]);
+  gfx_line(x0, y0, x1, y1);
+  i += 1;
+);
+
+gfx_set(1, 1, 1, 0.5);
+cursor_x = gfx_w * (play_pos/npoints);
+gfx_line(cursor_x, 0, cursor_x, graph_h);
+
+// --- thumbnail preview of loaded image ---
+img_loaded ? (
+  prev_w = 100; prev_scale = prev_w / imgw;
+  gfx_dest = -1;
+  gfx_x = gfx_w - prev_w - 10; gfx_y = 8;
+  gfx_set(1,1,1,1);
+  gfx_blit(IMG, prev_scale, 0);
+);
+
+// --- click handling (edge-detected) ---
+click = (mouse_cap & 1) && !(prev_cap & 1);
+
+box_x = 10; box_y = gfx_h - 44; box_w = 460; box_h = 22;
+load_x = box_x + box_w + 8; load_w = 60;
+rescan_x = load_x + load_w + 8; rescan_w = 70;
+
+in_box    = mouse_x >= box_x    && mouse_x <= box_x+box_w    && mouse_y >= box_y && mouse_y <= box_y+box_h;
+in_load   = mouse_x >= load_x   && mouse_x <= load_x+load_w  && mouse_y >= box_y && mouse_y <= box_y+box_h;
+in_rescan = mouse_x >= rescan_x && mouse_x <= rescan_x+rescan_w && mouse_y >= box_y && mouse_y <= box_y+box_h;
+
+click ? (
+  in_box    ? editing = 1 : (editing = 0);
+  in_load   ? do_load = 1;
+  in_rescan && img_loaded ? do_rescan = 1;
+);
+
+// --- text entry ---
+editing ? (
+  key = gfx_getchar();
+  key > 0 ? (
+    key == 13 ? ( do_load = 1; editing = 0; ) : (
+    key == 8 ? (
+      len = strlen(#path);
+      len > 0 ? str_setchar(#path, len-1, 0);
+    ) : (
+    key >= 32 && key < 127 ? (
+      len = strlen(#path);
+      str_setchar(#path, len, key);
+    )));
+  );
+);
+
+// --- draw path box / buttons / status ---
+gfx_set(0.15,0.15,0.15,1); gfx_rect(box_x, box_y, box_w, box_h);
+gfx_set(editing ? 0.9 : 0.4, editing ? 0.7 : 0.4, 0.2, 1); gfx_rect(box_x, box_y, box_w, 1);
+gfx_set(1,1,1,1); gfx_x = box_x+4; gfx_y = box_y+4; gfx_drawstr(#path);
+
+gfx_set(0.2,0.4,0.2,1); gfx_rect(load_x, box_y, load_w, box_h);
+gfx_set(1,1,1,1); gfx_x = load_x+8; gfx_y = box_y+4; gfx_drawstr("Load");
+
+gfx_set(img_loaded ? 0.2 : 0.15, img_loaded ? 0.3 : 0.15, img_loaded ? 0.4 : 0.15, 1);
+gfx_rect(rescan_x, box_y, rescan_w, box_h);
+gfx_set(1,1,1, img_loaded ? 1 : 0.4); gfx_x = rescan_x+6; gfx_y = box_y+4; gfx_drawstr("Rescan");
+
+gfx_set(0.7,0.7,0.7,1); gfx_x = 10; gfx_y = box_y - 16;
+status_str = img_loaded ?
+  sprintf(#statustxt, "Loaded %dx%d px | mode: %s | %s", imgw, imgh, mode==0?"Internal Sine":"MPE MIDI Out", loop?"loop":"one-shot") :
+  sprintf(#statustxt, "No image loaded - drag & drop a PNG, or type a path and click Load");
+gfx_drawstr(#statustxt);
+
+prev_cap = mouse_cap;
+
+@block
+
+midi_pos = 0;
+
+@sample
+
+step = npoints / (dur*srate);
+play_pos += step;
+play_pos >= npoints ? (
+  loop ? play_pos -= npoints : (
+    play_pos = npoints - 1;
+    mode == 1 && note_active ? (
+      midisend(midi_pos, 0x80 | (mpe_ch - 1), cur_note, 0);
+      note_active = 0;
+    );
+  );
+);
+
+idx0 = floor(play_pos);
+idx1 = min(idx0+1, npoints-1);
+frac = play_pos - idx0;
+cv   = traj[idx0] + (traj[idx1]-traj[idx0]) * frac;
+dv   = dens[idx0] + (dens[idx1]-dens[idx0]) * frac;
+
+mode == 0 ? (
+
+  // --- Internal simple sine, driven directly by the scanned curve ---
+  note = pitchlo + cv*(pitchhi-pitchlo);
+  cur_freq = 440*pow(2,(note-69)/12);
+  osc_phase += cur_freq/srate;
+  osc_phase -= floor(osc_phase);
+  sig = sin(2*$pi*osc_phase) * (0.15 + dv*0.25);
+
+  spl0 = sig;
+  spl1 = sig;
+
+) : (
+
+  // --- MPE MIDI out: one continuous glide voice on mpe_ch, driven by
+  // pitch-bend (no retriggering), with density -> CC74 (brightness). ---
+  spl0 = 0; spl1 = 0;
+
+  play_state != 0 && img_loaded ? (
+    !note_active ? (
+      base_note = floor((pitchlo+pitchhi)*0.5 + 0.5);
+      base_note = max(0, min(127, base_note));
+      midisend(midi_pos, 0x90 | (mpe_ch - 1), base_note, velocity);
+      note_active = 1;
+      cur_note = base_note;
+    );
+
+    ctrl_count += 1;
+    ctrl_count >= ctrl_rate ? (
+      ctrl_count = 0;
+
+      note  = pitchlo + cv*(pitchhi-pitchlo);
+      semis = note - cur_note;
+      semis = max(-bendrange, min(bendrange, semis));
+
+      bend14 = 8192 + floor(semis/bendrange*8191);
+      bend14 = max(0, min(16383, bend14));
+      bend_msb = floor(bend14/128);
+      bend_lsb = bend14 - bend_msb*128;
+      midisend(midi_pos, 0xE0 | (mpe_ch - 1), bend_lsb, bend_msb);
+
+      cc = max(0, min(127, floor(dv*127)));
+      midisend(midi_pos, 0xB0 | (mpe_ch - 1), 74, cc);
+    );
+  ) : (
+    note_active ? (
+      midisend(midi_pos, 0x80 | (mpe_ch - 1), cur_note, 0);
+      note_active = 0;
+    );
+  );
+);
+
+midi_pos += 1;

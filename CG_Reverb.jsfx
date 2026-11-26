@@ -1,0 +1,189 @@
+desc:CG Reverb - 8-line feedback delay network with freeze, modulation and analysis-driven decay
+tags:musique-concrete reverb fdn freeze live
+slider1:1<0.3,3,0.001:log>Size
+slider2:3<0.2,30,0.01:log>Decay RT60 (s)
+slider3:5000<500,16000,1:log>Damping (Hz)
+slider4:0.4<0,1,0.01>Modulation Depth
+slider5:0.4<0.05,3,0.01:log>Modulation Rate (Hz)
+slider6:20<0,200,1>Pre-delay (ms)
+slider7:0<0,1,1{Off,FREEZE}>Freeze
+slider8:-6<-60,6,0.1>Wet (dB)
+slider9:0<-60,6,0.1>Dry (dB)
+slider10:0<0,3,1{Auto,L,R,L+R}>Input
+slider11:1<1,4,1>Analysis Bus (1-4)
+slider12:0<0,6,1{None,Level,Onset,Brightness,Noisiness,Flux,Pitch}>Mod Source
+slider13:0<-1,1,0.01>Mod -> Decay (+-2 octaves of time)
+slider14:0<-1,1,0.01>Mod -> Damping (+-2 octaves)
+slider15:0<0,1,1{-,PANIC}>Panic / Clear
+
+in_pin:Input L
+in_pin:Input R
+out_pin:Output L
+out_pin:Output R
+options:gmem=CGbus no_meter
+
+@init
+
+ext_noinit=1;
+PI=3.141592653589793; TWOPI=6.283185307179586; CEIL=2;
+
+// ---- NaN-safe primitives. Comparisons with NaN are false, so every function below maps NaN/inf to a finite value ----
+function lim(x,lo,hi) ( x>=lo ? (x<=hi ? x : hi) : lo );
+function fin(x) ( abs(x)<100000 ? x : 0 );
+function db2lin(d) ( exp(lim(d,-120,60)*0.11512925464970229) );
+function dbgain(d) ( d<=-59.9 ? 0 : db2lin(d) );
+function lin2db(x) ( 8.685889638065035*log(abs(x)+0.000000001) );
+function sat(x) ( abs(x)<3 ? x*(27+x*x)/(27+9*x*x) : (x>0 ? 1 : -1) );
+function sclip(x,c) local(ax,k,y) ( ax=abs(x); k=c*0.7; y=ax<k ? ax : k+(c-k)*sat((ax-k)/(c-k)); x<0 ? -y : y );
+function mixf(a,b,t) ( a+(b-a)*t );
+function lpc(fc) ( 1-exp(-TWOPI*lim(fc,1,srate*0.45)/srate) );
+function smooth01(t) ( t<=0 ? 0 : (t>=1 ? 1 : t*t*(3-2*t)) );
+function rnd() ( rng=rng*1664525+1013904223; rng-=floor(rng/4294967296)*4294967296; rng/4294967296 );
+function rnds() ( rnd()*2-1 );
+function alloc(sz) local(p) ( p=mp; mp+=sz; memset(p,0,sz); p );
+
+// ---- mono input pick (guitar usually lives on one channel) + DC block ----
+function pick_in() local(yy) (
+  eL+=(inL*inL-eL)*0.0005; eR+=(inR*inR-eR)*0.0005;
+  imode<0.5 ? ( xm = eR<0.0005*eL ? inL : (eL<0.0005*eR ? inR : (inL+inR)*0.5) )
+  : ( imode<1.5 ? ( xm=inL ) : ( imode<2.5 ? ( xm=inR ) : ( xm=(inL+inR)*0.5 ) ) );
+  yy=xm-dcx+dcr*dcy; dcx=xm; dcy=yy; xm=fin(yy);
+);
+
+// ---- onset detector (fast/slow envelope ratio with refractory time) ----
+function ons_proc(x) local(a) (
+  a=abs(x);
+  ons_f+=(a-ons_f)*(a>ons_f ? ons_kfa : ons_kfr);
+  ons_s+=(a-ons_s)*(a>ons_s ? ons_ksa : ons_ksr);
+  ons_ev=0;
+  ons_cool>0 ? ons_cool-=1;
+  (ons_cool<=0 && ons_f>ons_thr && ons_f>ons_s*ons_ratio) ? ( ons_ev=1; ons_cool=ons_refr; ons_cnt+=1; );
+);
+
+// ---- analysis bus (written by CG_Analyzer, optional for every other module) ----
+function bus_update() (
+  bus_b=(lim(floor(bus_sel+0.5),1,4)-1)*16;
+  hb=gmem[bus_b];
+  abs(hb-hb_last)>0.5 ? ( hb_last=hb; bus_stale=0; ) : ( bus_stale+=samplesblock; );
+  bus_alive=bus_stale<srate*0.4;
+);
+function bus_get(sel) ( (sel>0.5 && bus_alive) ? lim(gmem[bus_b+floor(sel+0.5)],0,1) : 0 );
+function bus_onset() local(c,r) ( r=0; bus_alive ? ( c=gmem[bus_b+10]; abs(c-bus_cnt_last)>0.5 ? ( r=1; bus_cnt_last=c; ); ); r );
+mp=0;
+
+NL=8;
+DLM=floor(srate*0.34)+16;
+PDM=floor(srate*0.26)+8;
+lb=alloc(NL*DLM); pdb=alloc(PDM);
+lp_=alloc(NL); gg=alloc(NL); phs=alloc(NL); bms=alloc(NL); sg=alloc(NL); vv=alloc(NL);
+setl=0;
+bms[0]=29.7; bms[1]=37.1; bms[2]=41.1; bms[3]=43.7; bms[4]=53.1; bms[5]=59.3; bms[6]=67.7; bms[7]=73.9;
+sg[0]=1; sg[1]=-1; sg[2]=1; sg[3]=-1; sg[4]=1; sg[5]=1; sg[6]=-1; sg[7]=-1;
+i=0; while(i<NL) ( phs[i]=i/8; i+=1; );
+wp=0; pwp=0; size_s=1; size_t=1; rt=3; kd_t=0.5; kd_e=0.5; freeze=0; mdep=0; mrate=0.4; pdn=0; pdn_s=0; ctl=0;
+k_size=1-exp(-1/(0.3*srate)); md_dec=0; md_dmp=0; dn=0.000000000000001; damp_hz=5000;
+
+function do_clear() ( memset(lb,0,NL*DLM); memset(pdb,0,PDM); memset(lp_,0,NL); memset(vv,0,NL); );
+
+function read_params() (
+
+bus_sel=slider11; imode=slider10; msel=slider12;
+T_wet=dbgain(slider8); T_dry=dbgain(slider9);
+freeze=slider7>0.5; T_ing=freeze ? 0 : 1;
+md_dec=lim(slider13,-1,1); md_dmp=lim(slider14,-1,1); mod_t=bus_get(msel);
+size_t=lim(slider1,0.3,3);
+rt=lim(slider2,0.2,30)*exp(md_dec*mod_s*1.3862943611198906); rt=lim(rt,0.1,60);
+damp_hz=lim(slider3,500,16000)*exp(md_dmp*mod_s*1.3862943611198906); damp_hz=lim(damp_hz,300,18000);
+kd_t=lpc(damp_hz);
+mdep=lim(slider4,0,1)*0.004*srate; mrate=lim(slider5,0.05,3);
+pdn=lim(slider6,0,200)*0.001*srate;
+
+);
+function copy_params() ( P_wet=T_wet; P_dry=T_dry; P_ing=T_ing; );
+
+// ---- panic machine: fade wet out, clear every buffer, fade back in. Triggered by button or by internal watchdog ----
+function panic_step() (
+  (panic_req>0.5 && pan_ph==0) ? ( pan_ph=1; );
+  panic_req=0;
+  pan_ph==1 ? ( pan_g-=pan_dn; pan_g<=0 ? ( pan_g=0; do_clear(); pan_ph=2; pan_hold=floor(0.03*srate); ); );
+  pan_ph==2 ? ( pan_hold-=1; pan_hold<=0 ? ( pan_ph=3; ); );
+  pan_ph==3 ? ( pan_g+=pan_up; pan_g>=1 ? ( pan_g=1; pan_ph=0; ); );
+  pan_gs=pan_g*pan_g*(3-2*pan_g);
+);
+
+// ---- final stage: wet DC block, dry/wet sum, finite scrub, soft ceiling at +6 dB ----
+function finish() local(yy) (
+  wL=fin(wL); wR=fin(wR);
+  yy=wL-wxL+dcr*wyL; wxL=wL; wyL=yy; wL=yy;
+  yy=wR-wxR+dcr*wyR; wxR=wR; wyR=yy; wR=yy;
+  oL=sclip(fin(inL*P_dry+wL*P_wet*pan_gs),CEIL);
+  oR=sclip(fin(inR*P_dry+wR*P_wet*pan_gs),CEIL);
+  spl0=oL; spl1=oR;
+);
+
+smc=1-exp(-1/(0.015*srate));
+kmod=1-exp(-1/(0.004*srate));
+dcr=1-TWOPI*10/srate;
+pan_dn=1/(0.01*srate); pan_up=1/(0.05*srate); pan_g=1; pan_gs=1; pan_ph=0; panic_req=0;
+ons_kfa=1-exp(-1/(0.001*srate)); ons_kfr=1-exp(-1/(0.025*srate));
+ons_ksa=1-exp(-1/(0.040*srate)); ons_ksr=1-exp(-1/(0.250*srate));
+ons_ratio=2.2; ons_thr=db2lin(-52); ons_refr=floor(0.07*srate);
+bus_sel=1; imode=0; pfirst=1;
+rng=7011;
+
+@block
+
+bus_update();
+pan_btn=slider15; (pan_btn>0.5 && pan_prev<0.5) ? ( panic_req=1; ); pan_prev=pan_btn;
+read_params();
+pfirst ? ( copy_params(); pfirst=0; );
+
+
+@sample
+
+inL=fin(spl0); inR=fin(spl1);
+pick_in();
+ons_proc(xm);
+panic_step();
+mod_s+=(mod_t-mod_s)*kmod;
+P_wet+=(T_wet-P_wet)*smc;
+P_dry+=(T_dry-P_dry)*smc;
+P_ing+=(T_ing-P_ing)*smc;
+
+dn=-dn;
+size_s+=(size_t-size_s)*k_size;
+pdn_s+=(pdn-pdn_s)*0.0005;
+// control tick: loop gains from RT60 (freeze = unity loop, no damping)
+(ctl+=1)>=32 ? (
+  ctl=0; i=0;
+  while(i<NL) ( gg[i]=freeze ? 0.99999 : min(exp(-6.907755278982137*(bms[i]*0.001*srate*size_s)/(srate*rt)),0.9995); i+=1; );
+  kd_e=freeze ? 1 : kd_t;
+);
+// pre-delay
+pdb[pwp]=xm*P_ing;
+prp=pwp-pdn_s; prp<0 ? (prp+=PDM); pi0=floor(prp); pfr=prp-pi0; pi1=pi0+1; pi1>=PDM ? (pi1=0); pi0>=PDM ? (pi0=PDM-1);
+inp=pdb[pi0]*(1-pfr)+pdb[pi1]*pfr;
+pwp+=1; pwp>=PDM ? (pwp=0);
+// read lines
+sum=0; oL=0; oR=0; i=0;
+while(i<NL) (
+  Di=bms[i]*0.001*srate*size_s+mdep*sin(TWOPI*phs[i]); Di=lim(Di,8,DLM-4);
+  phs[i]+=mrate*(0.8+0.05*i)/srate; phs[i]>=1 ? (phs[i]-=1);
+  base=lb+i*DLM;
+  rp=wp-Di; rp<0 ? (rp+=DLM);
+  i0=floor(rp); fr=rp-i0; i1=i0+1; i1>=DLM ? (i1=0); i0>=DLM ? (i0=DLM-1);
+  rv=base[i0]*(1-fr)+base[i1]*fr;
+  lp_[i]+=kd_e*(rv-lp_[i]);
+  v=lp_[i]*gg[i]; vv[i]=v; sum+=v;
+  oL+=v*sg[i]; oR+=v*sg[(i+3)&7];
+  abs(lp_[i])<50 ? 0 : ( panic_req=1; );
+  i+=1;
+);
+// write lines through a Householder (energy preserving) matrix
+sum*=0.25; i=0;
+while(i<NL) ( lb[i*DLM+wp]=sclip(vv[i]-sum+inp*sg[i]*0.35+dn,3); i+=1; );
+wp+=1; wp>=DLM ? (wp=0);
+wL=oL*0.35; wR=oR*0.35;
+(abs(wL)<20 && abs(wR)<20) ? 0 : ( panic_req=1; wL=0; wR=0; );
+finish();
+

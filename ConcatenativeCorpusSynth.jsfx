@@ -1,0 +1,325 @@
+desc:Concatenative Corpus Synth (descriptor-space grain resynthesis)
+
+// Concatenative / corpus-based micro-synthesis.
+// Continuously records the input into a circular corpus buffer, segments it
+// into grains, and analyzes each grain for three cheap descriptors:
+//   - loudness   (RMS)
+//   - brightness (highpass/lowpass energy ratio, FFT-free spectral proxy)
+//   - pitch      (zero-crossing rate estimate)
+// A density-driven scheduler then searches the whole corpus for the grain(s)
+// whose descriptors best match a target point (manual, or auto-wandering via
+// a bounded random walk) and triggers it through an overlap-add granular
+// voice bank. This is the CataRT/unit-selection idea in miniature: instead of
+// picking a waveform by name, you pick it by what it *sounds like*.
+
+slider1:record=1<0,1,1{Off,On}>Record Corpus
+slider2:grain_ms=60<10,300,1>Grain Size (ms)
+slider3:density=15<1,60,0.1>Grain Density (grains/sec)
+slider4:playrate=1<0.25,4,0.001>Playback Rate
+slider5:target_bright=0.5<0,1,0.001>Target Brightness
+slider6:target_pitch=220<40,2000,1>Target Pitch (Hz)
+slider7:target_loud=0.5<0,1,0.001>Target Loudness
+slider8:wander=0<0,1,0.001>Auto-Wander Amount
+slider9:jitter=0.2<0,1,0.001>Selection Jitter
+slider10:pitchlock=0<0,1,0.001>Pitch-Correct Playback
+slider11:spread=0.3<0,1,0.001>Stereo Spread
+slider12:clear=0<0,1,1{Off,On}>Clear Corpus (toggle)
+slider13:outgain=0.7<0,2,0.001>Output Gain
+slider14:mix=1<0,1,0.001>Dry/Wet
+
+@init
+
+MAX_CORPUS_SEC = 8;
+MAX_GRAINS     = 2048;
+MAX_VOICES     = 16;
+TOPK           = 5;
+EPS            = 0.0000001;
+
+function lcg_next() (
+  // custom LCG (EEL2 has no srand) - returns 0..1
+  g_seed = (g_seed*1103515245 + 12345) & 2147483647;
+  g_seed / 2147483647;
+);
+
+function hann(ph) (
+  0.5 - 0.5*cos(2*$pi*ph);
+);
+
+function softclip(x) (
+  x / (1 + abs(x));
+);
+
+function pitch_norm(hz) local(v) (
+  v = log(max(hz,40)/40) / pn_denom;
+  max(0, min(1, v));
+);
+
+corpus_cap = floor(MAX_CORPUS_SEC*srate);
+
+freemem  = 0;
+corpus_buf = freemem; freemem += corpus_cap;
+g_start  = freemem; freemem += MAX_GRAINS;
+g_len    = freemem; freemem += MAX_GRAINS;
+g_rms    = freemem; freemem += MAX_GRAINS;
+g_bright = freemem; freemem += MAX_GRAINS;
+g_pitch  = freemem; freemem += MAX_GRAINS;
+g_valid  = freemem; freemem += MAX_GRAINS;
+
+v_active = freemem; freemem += MAX_VOICES;
+v_pos    = freemem; freemem += MAX_VOICES;
+v_start  = freemem; freemem += MAX_VOICES;
+v_len    = freemem; freemem += MAX_VOICES;
+v_phase  = freemem; freemem += MAX_VOICES;
+v_pan    = freemem; freemem += MAX_VOICES;
+v_rate   = freemem; freemem += MAX_VOICES;
+v_gidx   = freemem; freemem += MAX_VOICES;
+
+bestidx  = freemem; freemem += TOPK;
+bestdist = freemem; freemem += TOPK;
+
+g_seed = 987654321;
+pn_denom = log(2000/40);
+
+wpos = 0;
+next_grain_index = 0;
+grain_accum = 0;
+grain_start_pos = 0;
+grain_len_samples = floor(grain_ms/1000*srate);
+
+sum_sq = 0; sum_lp_sq = 0; sum_hp_sq = 0; zero_cross_count = 0;
+lp_slow = 0; last_sign = 1;
+lp_coeff_slow = exp(-1/(0.0003*srate)); // ~500 Hz-ish tracking lowpass
+
+trigger_timer = 0;
+
+smooth_coef = exp(-1/(0.02*srate));
+sm_bright = target_bright; sm_pitch = target_pitch; sm_loud = target_loud;
+sm_spread = spread; sm_mix = mix;
+
+wander_bn = 0.5; wander_pn = 0.5;
+
+last_clear = 0;
+
+@slider
+
+grain_len_samples_next = floor(grain_ms/1000*srate);
+interval_samples = max(1, floor(srate/density));
+
+(clear >= 0.5 && last_clear < 0.5) ? (
+  memset(g_valid, 0, MAX_GRAINS);
+  next_grain_index = 0;
+  wpos = 0;
+  grain_accum = 0;
+);
+last_clear = clear;
+
+@sample
+
+dry_l = spl0; dry_r = spl1;
+
+sm_bright += (target_bright - sm_bright)*(1-smooth_coef);
+sm_pitch  += (target_pitch  - sm_pitch )*(1-smooth_coef);
+sm_loud   += (target_loud   - sm_loud  )*(1-smooth_coef);
+sm_spread += (spread - sm_spread)*(1-smooth_coef);
+sm_mix    += (mix - sm_mix)*(1-smooth_coef);
+
+// bounded random-walk wander in normalized descriptor space
+wander_bn += (lcg_next()*2-1)*0.004; wander_bn = max(0,min(1,wander_bn));
+wander_pn += (lcg_next()*2-1)*0.004; wander_pn = max(0,min(1,wander_pn));
+wander_pitch_hz = 40*exp(wander_pn*pn_denom);
+
+eff_bright = sm_bright*(1-wander) + wander_bn*wander;
+eff_pitch  = sm_pitch *(1-wander) + wander_pitch_hz*wander;
+eff_loud   = sm_loud;
+
+//------------------------------------------------------------
+// corpus recording + grain segmentation/analysis
+//------------------------------------------------------------
+record >= 0.5 ? (
+
+  grain_accum == 0 ? (
+    grain_len_samples = grain_len_samples_next;
+    (wpos + grain_len_samples > corpus_cap) ? wpos = 0;
+    grain_start_pos = wpos;
+  );
+
+  x = dry_l;
+  corpus_buf[wpos] = x;
+
+  sum_sq += x*x;
+  lp_slow += lp_coeff_slow*(x - lp_slow);
+  hp_val = x - lp_slow;
+  sum_lp_sq += lp_slow*lp_slow;
+  sum_hp_sq += hp_val*hp_val;
+
+  cur_sign = (x >= 0) ? 1 : -1;
+  (cur_sign != last_sign) ? zero_cross_count += 1;
+  last_sign = cur_sign;
+
+  wpos += 1;
+  grain_accum += 1;
+
+  grain_accum >= grain_len_samples ? (
+    slot = next_grain_index;
+    grain_dur_sec = grain_len_samples/srate;
+
+    g_start[slot]  = grain_start_pos;
+    g_len[slot]    = grain_len_samples;
+    g_rms[slot]    = sqrt(sum_sq/grain_len_samples);
+    g_bright[slot] = sum_hp_sq / (sum_hp_sq+sum_lp_sq+EPS);
+    g_pitch[slot]  = zero_cross_count / (2*grain_dur_sec);
+    g_valid[slot]  = 1;
+
+    next_grain_index = (slot+1) % MAX_GRAINS;
+    grain_accum = 0;
+    sum_sq = 0; sum_lp_sq = 0; sum_hp_sq = 0; zero_cross_count = 0;
+  );
+);
+
+//------------------------------------------------------------
+// grain-trigger scheduler: descriptor-space nearest-neighbor search
+//------------------------------------------------------------
+trigger_timer -= 1;
+trigger_timer <= 0 ? (
+  trigger_timer = max(1, floor(srate/density));
+
+  k = 0;
+  while (k < TOPK) ( bestdist[k] = 999999999; bestidx[k] = -1; k += 1; );
+
+  pn_target = pitch_norm(eff_pitch);
+
+  gi = 0;
+  while (gi < MAX_GRAINS) (
+    g_valid[gi] == 1 ? (
+      pn_g = pitch_norm(g_pitch[gi]);
+      ln_g = max(0,min(1, g_rms[gi]*4));
+      d = (pn_target-pn_g)*(pn_target-pn_g)
+        + (eff_bright-g_bright[gi])*(eff_bright-g_bright[gi])
+        + (eff_loud-ln_g)*(eff_loud-ln_g);
+
+      d < bestdist[TOPK-1] ? (
+        // insertion sort into top-K
+        k = TOPK-1;
+        while (k > 0 && bestdist[k-1] > d) (
+          bestdist[k] = bestdist[k-1]; bestidx[k] = bestidx[k-1];
+          k -= 1;
+        );
+        bestdist[k] = d; bestidx[k] = gi;
+      );
+    );
+    gi += 1;
+  );
+
+  bestidx[0] >= 0 ? (
+    // jitter: with probability = jitter, pick a random slot among top-K instead of the best
+    validk = 0;
+    while (validk < TOPK && bestidx[validk] >= 0) ( validk += 1; );
+    sel = (lcg_next() < jitter && validk > 1) ? floor(lcg_next()*validk) : 0;
+    chosen = bestidx[sel];
+
+    // find a free voice
+    vfree = -1; vi = 0;
+    while (vi < MAX_VOICES && vfree < 0) (
+      v_active[vi] == 0 ? vfree = vi;
+      vi += 1;
+    );
+
+    vfree >= 0 ? (
+      rate = playrate;
+      pitchlock > 0 ? (
+        gp = max(g_pitch[chosen], 20);
+        rate = playrate * (1 + pitchlock*((eff_pitch/gp) - 1));
+        rate = max(0.1, min(8, rate));
+      );
+
+      v_active[vfree] = 1;
+      v_start[vfree]  = g_start[chosen];
+      v_len[vfree]    = g_len[chosen];
+      v_pos[vfree]    = 0;
+      v_phase[vfree]  = 0;
+      v_rate[vfree]   = rate;
+      v_pan[vfree]    = (lcg_next()*2-1)*sm_spread;
+      v_gidx[vfree]   = chosen;
+    );
+  );
+);
+
+//------------------------------------------------------------
+// voice playback: overlap-add granular resynthesis
+//------------------------------------------------------------
+outL = 0; outR = 0;
+
+vi = 0;
+while (vi < MAX_VOICES) (
+  v_active[vi] == 1 ? (
+    p = v_pos[vi];
+    i0 = floor(p);
+    frac = p - i0;
+    len = v_len[vi];
+
+    (i0 < len-1) ? (
+      s0 = corpus_buf[v_start[vi]+i0];
+      s1 = corpus_buf[v_start[vi]+i0+1];
+      samp = s0 + (s1-s0)*frac;
+
+      env = hann(v_phase[vi]);
+      pan = v_pan[vi];
+      outL += samp*env*(0.5*(1-pan));
+      outR += samp*env*(0.5*(1+pan));
+
+      v_pos[vi]   += v_rate[vi];
+      v_phase[vi] += v_rate[vi]/len;
+
+      (v_phase[vi] >= 1 || v_pos[vi] >= len-1) ? v_active[vi] = 0;
+    ) : v_active[vi] = 0;
+  );
+  vi += 1;
+);
+
+wetL = softclip(outL*outgain);
+wetR = softclip(outR*outgain);
+
+spl0 = dry_l*(1-sm_mix) + wetL*sm_mix;
+spl1 = dry_r*(1-sm_mix) + wetR*sm_mix;
+
+@gfx 420 300
+
+gfx_clear = 0x101010;
+gfx_r=0.15; gfx_g=0.15; gfx_b=0.18; gfx_rect(0,0,gfx_w,gfx_h);
+
+// descriptor space: x = pitch (log-normalized), y = brightness (inverted)
+gi = 0;
+while (gi < MAX_GRAINS) (
+  g_valid[gi] == 1 ? (
+    px = pitch_norm(g_pitch[gi])*gfx_w;
+    py = (1-g_bright[gi])*gfx_h;
+    sz = 1 + max(0,min(1,g_rms[gi]*4))*3;
+    gfx_r=0.35; gfx_g=0.55; gfx_b=0.75; gfx_a=0.55;
+    gfx_rect(px-sz*0.5, py-sz*0.5, sz, sz);
+  );
+  gi += 1;
+);
+
+// active voices
+vi = 0;
+while (vi < MAX_VOICES) (
+  v_active[vi] == 1 ? (
+    gidx = v_gidx[vi];
+    px = pitch_norm(g_pitch[gidx])*gfx_w;
+    py = (1-g_bright[gidx])*gfx_h;
+    gfx_r=1; gfx_g=0.8; gfx_b=0.2; gfx_a=0.9;
+    gfx_rect(px-3, py-3, 6, 6);
+  );
+  vi += 1;
+);
+
+// target crosshair
+tx = pitch_norm(eff_pitch)*gfx_w;
+ty = (1-eff_bright)*gfx_h;
+gfx_r=1; gfx_g=0.3; gfx_b=0.3; gfx_a=1;
+gfx_line(tx-8, ty, tx+8, ty);
+gfx_line(tx, ty-8, tx, ty+8);
+
+gfx_r=0.6; gfx_g=0.6; gfx_b=0.6; gfx_a=0.8;
+gfx_x=6; gfx_y=6;
+gfx_drawstr("pitch -->  |  brightness (up = darker)");

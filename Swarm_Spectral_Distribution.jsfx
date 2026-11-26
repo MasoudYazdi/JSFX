@@ -1,0 +1,223 @@
+desc:Swarm-Based Spectral Distribution
+
+// ============================================================================
+// SWARM-BASED SPECTRAL DISTRIBUTION
+//
+// A flock of up to 32 sinusoidal agents moves through a 2D "spectral space":
+//   x-axis = log-frequency, normalized 0..1 between freq_min and freq_max
+//   y-axis = amplitude/prominence, normalized 0..1
+//
+// Standard boids rules (cohesion / separation / alignment) govern agent
+// motion in this space, plus a user-placed attractor point and a chaos
+// (entropy) term that injects stochastic jitter. The resulting agent
+// positions are read back each control step as (frequency, amplitude) pairs
+// and rendered as smoothed sine partials, panned by their spectral position.
+//
+// Conceptually: a stochastic cloud (Xenakis) whose internal cohesion is a
+// tunable parameter rather than a fixed probability distribution — the
+// swarm rules let you slide continuously between chaotic dispersion
+// (masses) and self-organized clustering (formant-like concentrations).
+//
+// Control-rate physics update every block_size_ctrl samples; per-sample
+// one-pole smoothing of freq/amp avoids zipper noise between updates.
+// ============================================================================
+
+slider1:num_agents=12<2,32,1>Swarm Size (agents)
+slider2:freq_min=80<20,2000,1>Spectral Range Min (Hz)
+slider3:freq_max=4000<200,18000,1>Spectral Range Max (Hz)
+slider4:cohesion=0.3<0,1,0.001>Cohesion
+slider5:separation=0.5<0,1,0.001>Separation
+slider6:alignment=0.2<0,1,0.001>Alignment
+slider7:attract_strength=0.3<0,1,0.001>Attractor Strength
+slider8:attract_freq=1000<20,18000,1>Attractor Frequency (Hz)
+slider9:chaos=0.1<0,1,0.001>Chaos / Entropy
+slider10:swarm_speed=1<0.05,5,0.01>Swarm Speed
+slider11:sep_radius=0.15<0.02,0.5,0.001>Separation Radius
+slider12:out_gain=0.5<0,2,0.001>Output Gain
+slider13:stereo_spread=0.7<0,1,0.001>Stereo Spread
+slider14:smoothing_ms=15<1,200,1>Parameter Smoothing (ms)
+
+@init
+
+MAX_AGENTS = 32;
+freemem = 0;
+function alloc(sz) local(p) (
+  p = freemem;
+  freemem += sz;
+  p;
+);
+
+ax    = alloc(MAX_AGENTS);  // position x : log-freq space, 0..1
+ay    = alloc(MAX_AGENTS);  // position y : amplitude space, 0..1
+avx   = alloc(MAX_AGENTS);  // velocity x
+avy   = alloc(MAX_AGENTS);  // velocity y
+aph   = alloc(MAX_AGENTS);  // oscillator phase, 0..1
+afreq = alloc(MAX_AGENTS);  // smoothed output frequency (Hz)
+aamp  = alloc(MAX_AGENTS);  // smoothed output amplitude
+tfreq = alloc(MAX_AGENTS);  // control-rate target frequency
+tamp  = alloc(MAX_AGENTS);  // control-rate target amplitude
+
+i = 0;
+while (i < MAX_AGENTS) (
+  ax[i]  = rand(1);
+  ay[i]  = rand(1);
+  avx[i] = (rand(1)-0.5)*0.02;
+  avy[i] = (rand(1)-0.5)*0.02;
+  aph[i] = rand(1);
+  afreq[i] = 440;
+  aamp[i]  = 0;
+  tfreq[i] = 440;
+  tamp[i]  = 0;
+  i += 1;
+);
+
+block_counter  = 0;
+block_size_ctrl = 512; // control-rate physics update interval, in samples
+
+// ----------------------------------------------------------------------
+function swarm_step() local(i,j,cx,cy,dx,dy,dist,fx,fy,sx,sy,cnt,nvx,nvy,speed) (
+
+  cx = 0; cy = 0;
+  i = 0;
+  while (i < n_agents) (
+    cx += ax[i]; cy += ay[i];
+    i += 1;
+  );
+  cx /= n_agents; cy /= n_agents;
+
+  i = 0;
+  while (i < n_agents) (
+
+    fx = 0; fy = 0;
+
+    // cohesion: steer toward swarm centroid
+    fx += (cx - ax[i]) * cohesion;
+    fy += (cy - ay[i]) * cohesion;
+
+    // separation + alignment: neighbor scan
+    sx = 0; sy = 0;
+    nvx = 0; nvy = 0;
+    cnt = 0;
+    j = 0;
+    while (j < n_agents) (
+      j != i ? (
+        dx = ax[i] - ax[j];
+        dy = ay[i] - ay[j];
+        dist = sqrt(dx*dx + dy*dy);
+        (dist < sep_radius && dist > 0.00001) ? (
+          sx += dx/dist/dist;
+          sy += dy/dist/dist;
+        );
+        dist < sep_radius*3 ? (
+          nvx += avx[j];
+          nvy += avy[j];
+          cnt += 1;
+        );
+      );
+      j += 1;
+    );
+    cnt > 0 ? (
+      nvx /= cnt; nvy /= cnt;
+      fx += (nvx - avx[i]) * alignment;
+      fy += (nvy - avy[i]) * alignment;
+    );
+    fx += sx * separation;
+    fy += sy * separation;
+
+    // attractor: pull toward user-placed spectral target
+    fx += (attract_x - ax[i]) * attract_strength;
+    fy += (1 - ay[i]) * attract_strength * 0.3;
+
+    // chaos / entropy: stochastic jitter
+    fx += (rand(2)-1) * chaos * 0.05;
+    fy += (rand(2)-1) * chaos * 0.05;
+
+    avx[i] = avx[i]*0.9 + fx * 0.1 * swarm_speed;
+    avy[i] = avy[i]*0.9 + fy * 0.1 * swarm_speed;
+
+    speed = sqrt(avx[i]*avx[i] + avy[i]*avy[i]);
+    speed > 0.05 ? (
+      avx[i] *= 0.05/speed;
+      avy[i] *= 0.05/speed;
+    );
+
+    ax[i] += avx[i];
+    ay[i] += avy[i];
+
+    // reflect at spectral-space boundaries
+    ax[i] < 0 ? (ax[i] = 0; avx[i] = -avx[i]);
+    ax[i] > 1 ? (ax[i] = 1; avx[i] = -avx[i]);
+    ay[i] < 0 ? (ay[i] = 0; avy[i] = -avy[i]);
+    ay[i] > 1 ? (ay[i] = 1; avy[i] = -avy[i]);
+
+    // read position back as synthesis targets
+    tfreq[i] = exp(logmin + ax[i]*(logmax-logmin));
+    tamp[i]  = ay[i]*ay[i]; // squared: gentler falloff near zero, avoids abrupt cutoff
+
+    i += 1;
+  );
+);
+
+@slider
+
+logmin = log(freq_min);
+logmax = log(freq_max);
+attract_x = (log(attract_freq) - logmin) / (logmax - logmin);
+attract_x = max(0, min(1, attract_x));
+smooth_coef = exp(-1/(0.001*smoothing_ms*srate));
+n_agents = floor(num_agents);
+
+@sample
+
+block_counter += 1;
+block_counter >= block_size_ctrl ? (
+  block_counter = 0;
+  swarm_step();
+);
+
+outL = 0; outR = 0;
+smooth_a = 1 - smooth_coef;
+
+i = 0;
+while (i < n_agents) (
+
+  afreq[i] += (tfreq[i] - afreq[i]) * smooth_a;
+  aamp[i]  += (tamp[i]  - aamp[i])  * smooth_a;
+
+  aph[i] += afreq[i] / srate;
+  aph[i] -= floor(aph[i]);
+
+  voice = sin(2*$pi*aph[i]) * aamp[i];
+
+  pan = (ax[i]*2 - 1) * stereo_spread;
+  panL = sqrt(0.5*(1-pan));
+  panR = sqrt(0.5*(1+pan));
+
+  outL += voice*panL;
+  outR += voice*panR;
+
+  i += 1;
+);
+
+g = out_gain / sqrt(max(n_agents,1));
+spl0 = outL*g;
+spl1 = outR*g;
+
+@gfx 640 400
+
+gfx_set(0,0,0,0.15);
+gfx_rect(0,0,gfx_w,gfx_h,1);
+
+i = 0;
+while (i < n_agents) (
+  px = ax[i]*gfx_w;
+  py = (1-ay[i])*gfx_h;
+  hue = ax[i];
+  gfx_set(0.3+0.7*hue, 0.5, 1-0.5*hue, 0.85);
+  r = 3 + aamp[i]*14;
+  gfx_circle(px, py, r, 1, 1);
+  i += 1;
+);
+
+gfx_set(1,1,1,0.6);
+gfx_circle(attract_x*gfx_w, gfx_h*0.5, 5, 0, 1);

@@ -1,0 +1,304 @@
+desc:Spatial Granulation Engine (Quad)
+options:gmem=SpatialGrain
+
+in_pin:Input L
+in_pin:Input R
+out_pin:Output FL
+out_pin:Output FR
+out_pin:Output BL
+out_pin:Output BR
+
+slider1:grain_size_ms=80<5,500,1>Grain Size (ms)
+slider2:density_hz=20<0.5,200,0.1>Grain Density (grains/sec)
+slider3:read_pos=0.5<0,1,0.001>Buffer Read Position
+slider4:pos_jitter=0.1<0,1,0.001>Position Jitter
+slider5:pitch_st=0<-24,24,0.01>Pitch (semitones)
+slider6:pitch_jitter=0<0,12,0.01>Pitch Jitter (st)
+slider7:size_jitter=0.2<0,1,0.01>Grain Size Jitter
+slider8:traj_mode=1<0,3,1{Static,Orbit,Spiral,Random Walk}>Spatial Trajectory
+slider9:traj_speed=0.5<0,5,0.01>Trajectory Speed (Hz)
+slider10:orbit_radius=0.7<0,1,0.001>Radius
+slider11:az_center=0<-180,180,1>Azimuth Center (deg)
+slider12:az_spread=180<0,180,1>Azimuth Spread (deg)
+slider13:dist_depth=0.5<0,1,0.001>Distance Depth
+slider14:air_absorb=0.5<0,1,0.001>Air Absorption
+slider15:out_gain_db=0<-24,12,0.1>Output Gain (dB)
+
+@init
+
+MAX_GRAINS = 32;
+BUF_SECONDS = 4;
+buflen = srate * BUF_SECONDS;
+
+PI = 3.14159265358979;
+TWOPI = 6.28318530717959;
+
+// ---- memory layout ----
+mptr = 0;
+circbuf = mptr; mptr += buflen;
+
+g_active  = mptr; mptr += MAX_GRAINS;
+g_age     = mptr; mptr += MAX_GRAINS;
+g_len     = mptr; mptr += MAX_GRAINS;
+g_readpos = mptr; mptr += MAX_GRAINS;
+g_pitch   = mptr; mptr += MAX_GRAINS;
+
+g_wcos    = mptr; mptr += MAX_GRAINS;
+g_wsin    = mptr; mptr += MAX_GRAINS;
+g_wrotc   = mptr; mptr += MAX_GRAINS;
+g_wrots   = mptr; mptr += MAX_GRAINS;
+
+g_ocos    = mptr; mptr += MAX_GRAINS;
+g_osin    = mptr; mptr += MAX_GRAINS;
+g_azoff   = mptr; mptr += MAX_GRAINS;
+g_radius  = mptr; mptr += MAX_GRAINS;
+g_dist    = mptr; mptr += MAX_GRAINS;
+g_az      = mptr; mptr += MAX_GRAINS;
+g_lp      = mptr; mptr += MAX_GRAINS;
+
+writepos = 0;
+trig_acc = 0;
+lcg_state = 987654321 + srate;
+
+smooth_grain_size = grain_size_ms;
+smooth_density    = density_hz;
+smooth_pos        = read_pos;
+smooth_pitch      = pitch_st;
+smooth_speed      = traj_speed;
+smooth_radius     = orbit_radius;
+smooth_azc        = az_center;
+smooth_azs        = az_spread;
+smooth_distd      = dist_depth;
+smooth_air        = air_absorb;
+smooth_gain       = 10 ^ (out_gain_db / 20);
+
+orot_c = 1; orot_s = 0;
+
+// ---- custom LCG (no builtin rand/srand) ----
+function lcg_rand() (
+  lcg_state = (lcg_state * 1103515245 + 12345) & 2147483647;
+  lcg_state / 2147483647;
+);
+
+function lcg_bi() (
+  lcg_rand() * 2 - 1;
+);
+
+function wrap_az(a) (
+  a > 180 ? a -= 360;
+  a < -180 ? a += 360;
+  a;
+);
+
+// writes qFL/qFR/qBL/qBR — quad VBAP between adjacent speaker pairs
+function quad_gains(az, dgain) local(a, quad, t, g1, g2) (
+  a = wrap_az(az);
+  a >= -45 && a < 45 ? (
+    quad = 0; t = (a + 45) / 90;
+  ) : a >= 45 && a < 135 ? (
+    quad = 1; t = (a - 45) / 90;
+  ) : a >= 135 || a < -135 ? (
+    quad = 2; t = (a >= 135 ? a - 135 : a + 225) / 90;
+  ) : (
+    quad = 3; t = (a + 135) / 90;
+  );
+  g1 = cos(t * PI * 0.5) * dgain;
+  g2 = sin(t * PI * 0.5) * dgain;
+  qFL = 0; qFR = 0; qBL = 0; qBR = 0;
+  quad == 0 ? ( qFL = g1; qFR = g2; );
+  quad == 1 ? ( qFR = g1; qBR = g2; );
+  quad == 2 ? ( qBR = g1; qBL = g2; );
+  quad == 3 ? ( qBL = g1; qFL = g2; );
+);
+
+function trigger_grain() local(i, found, lenms, lensmp, jit) (
+  found = -1;
+  i = 0;
+  while (i < MAX_GRAINS && found < 0) (
+    g_active[i] == 0 ? found = i;
+    i += 1;
+  );
+  found >= 0 ? (
+    i = found;
+    lenms = smooth_grain_size * (1 + lcg_bi() * size_jitter);
+    lenms = max(lenms, 5);
+    lensmp = floor(lenms * 0.001 * srate);
+    lensmp = max(lensmp, 8);
+    g_len[i] = lensmp;
+    g_age[i] = 0;
+    g_active[i] = 1;
+
+    jit = lcg_bi() * pos_jitter * buflen;
+    g_readpos[i] = writepos - (smooth_pos * buflen) + jit;
+    g_readpos[i] = g_readpos[i] % buflen;
+    g_readpos[i] < 0 ? g_readpos[i] += buflen;
+
+    g_pitch[i] = 2 ^ ((smooth_pitch + lcg_bi() * pitch_jitter) / 12);
+
+    g_wcos[i] = 1; g_wsin[i] = 0;
+    g_wrotc[i] = cos(TWOPI / lensmp);
+    g_wrots[i] = sin(TWOPI / lensmp);
+
+    g_ocos[i] = cos(lcg_rand() * TWOPI);
+    g_osin[i] = sin(lcg_rand() * TWOPI);
+    g_azoff[i] = lcg_bi() * smooth_azs;
+    g_radius[i] = smooth_radius * (0.7 + 0.3 * lcg_rand());
+    g_dist[i] = traj_mode == 2 ? 0 : g_radius[i];
+    g_az[i] = smooth_azc + g_azoff[i];
+  );
+);
+
+@slider
+smooth_gain = 10 ^ (out_gain_db / 20);
+
+@block
+
+coef = 1 - exp(-1 / (0.01 * srate));
+smooth_grain_size += (grain_size_ms - smooth_grain_size) * coef;
+smooth_density    += (density_hz - smooth_density) * coef;
+smooth_pos        += (read_pos - smooth_pos) * coef;
+smooth_pitch      += (pitch_st - smooth_pitch) * coef;
+smooth_speed      += (traj_speed - smooth_speed) * coef;
+smooth_radius     += (orbit_radius - smooth_radius) * coef;
+smooth_azc        += (az_center - smooth_azc) * coef;
+smooth_azs        += (az_spread - smooth_azs) * coef;
+smooth_distd      += (dist_depth - smooth_distd) * coef;
+smooth_air        += (air_absorb - smooth_air) * coef;
+
+rot_ang = TWOPI * smooth_speed / srate;
+orot_c = cos(rot_ang);
+orot_s = sin(rot_ang);
+
+@sample
+
+circbuf[writepos] = (spl0 + spl1) * 0.5;
+writepos += 1;
+writepos >= buflen ? writepos = 0;
+
+trig_acc += smooth_density / srate;
+trig_acc >= 1 ? (
+  trig_acc -= 1;
+  trigger_grain();
+);
+
+outFL = 0; outFR = 0; outBL = 0; outBR = 0;
+
+i = 0;
+while (i < MAX_GRAINS) (
+  g_active[i] ? (
+    rp = g_readpos[i];
+    ip = floor(rp);
+    frac = rp - ip;
+    ip0 = ip % buflen; ip0 < 0 ? ip0 += buflen;
+    ip1 = (ip0 + 1) % buflen;
+    s0 = circbuf[ip0];
+    s1 = circbuf[ip1];
+    samp = s0 + (s1 - s0) * frac;
+
+    g_readpos[i] = rp + g_pitch[i];
+    g_readpos[i] >= buflen ? g_readpos[i] -= buflen;
+    g_readpos[i] < 0 ? g_readpos[i] += buflen;
+
+    // Hann window via incremental rotation (no per-sample cos() call)
+    wc = g_wcos[i]; ws = g_wsin[i];
+    win = 0.5 - 0.5 * wc;
+    nwc = wc * g_wrotc[i] - ws * g_wrots[i];
+    nws = wc * g_wrots[i] + ws * g_wrotc[i];
+    g_wcos[i] = nwc; g_wsin[i] = nws;
+
+    traj_mode == 1 ? (
+      // Orbit: constant radius, steady rotation
+      oc = g_ocos[i]; os = g_osin[i];
+      noc = oc * orot_c - os * orot_s;
+      nos = oc * orot_s + os * orot_c;
+      g_ocos[i] = noc; g_osin[i] = nos;
+      g_az[i] = atan2(nos, noc) * 180 / PI + g_azoff[i];
+      g_dist[i] = g_radius[i];
+    ) : traj_mode == 2 ? (
+      // Spiral: radius grows from center to target over grain lifetime
+      prog = g_age[i] / g_len[i];
+      oc = g_ocos[i]; os = g_osin[i];
+      noc = oc * orot_c - os * orot_s;
+      nos = oc * orot_s + os * orot_c;
+      g_ocos[i] = noc; g_osin[i] = nos;
+      g_az[i] = atan2(nos, noc) * 180 / PI + g_azoff[i];
+      g_dist[i] = g_radius[i] * prog;
+    ) : traj_mode == 3 ? (
+      // Random walk in azimuth/distance
+      g_az[i] = wrap_az(g_az[i] + lcg_bi() * 2);
+      g_dist[i] = g_dist[i] + lcg_bi() * 0.01;
+      g_dist[i] < 0 ? g_dist[i] = 0;
+      g_dist[i] > 1 ? g_dist[i] = 1;
+    );
+    // traj_mode == 0 (Static): g_az / g_dist set once at trigger, held fixed
+
+    dnorm = min(g_dist[i], 1);
+    ampfall = 1 / (1 + dnorm * smooth_distd * 3);
+    lpcut = 1 - dnorm * smooth_air * 0.9;
+    lpcoef = max(lpcut, 0.05);
+    g_lp[i] = g_lp[i] + (samp - g_lp[i]) * lpcoef;
+    fsamp = g_lp[i] * win * ampfall;
+
+    quad_gains(g_az[i], 1);
+    outFL += fsamp * qFL;
+    outFR += fsamp * qFR;
+    outBL += fsamp * qBL;
+    outBR += fsamp * qBR;
+
+    g_age[i] += 1;
+    g_age[i] >= g_len[i] ? g_active[i] = 0;
+  );
+  i += 1;
+);
+
+// soft clip, not hard limit
+outFL = outFL / (1 + abs(outFL));
+outFR = outFR / (1 + abs(outFR));
+outBL = outBL / (1 + abs(outBL));
+outBR = outBR / (1 + abs(outBR));
+
+spl0 = outFL * smooth_gain;
+spl1 = outFR * smooth_gain;
+spl2 = outBL * smooth_gain;
+spl3 = outBR * smooth_gain;
+
+// ---- publish spatial state for the companion Atmosphere plugin ----
+active_count = 0;
+avg_dist = 0;
+i = 0;
+while (i < MAX_GRAINS) (
+  g_active[i] ? ( active_count += 1; avg_dist += g_dist[i]; );
+  i += 1;
+);
+active_count > 0 ? avg_dist /= active_count;
+
+gmem[0] = avg_dist;
+gmem[1] = active_count;
+gmem[2] = smooth_azs;
+gmem[3] = smooth_air;
+gmem[4] = smooth_distd;
+
+@gfx 300 300
+
+cx = gfx_w * 0.5; cy = gfx_h * 0.5; rad = min(gfx_w, gfx_h) * 0.42;
+gfx_set(0.35, 0.35, 0.4, 1);
+gfx_circle(cx, cy, rad, 0, 1);
+gfx_circle(cx, cy, rad * 0.5, 0, 1);
+
+i = 0;
+while (i < MAX_GRAINS) (
+  g_active[i] ? (
+    ang = g_az[i] * PI / 180;
+    rr = min(g_dist[i], 1) * rad;
+    px = cx + sin(ang) * rr;
+    py = cy - cos(ang) * rr;
+    lifefrac = g_age[i] / g_len[i];
+    gfx_set(0.9 - lifefrac * 0.4, 0.6, 1 - lifefrac * 0.5, 0.9);
+    gfx_circle(px, py, 3, 1, 1);
+  );
+  i += 1;
+);
+
+gfx_set(0.5, 0.9, 0.6, 1);
+gfx_x = 6; gfx_y = 6;
+gfx_drawnumber(active_count, 0);

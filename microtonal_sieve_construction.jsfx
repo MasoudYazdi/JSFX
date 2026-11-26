@@ -1,0 +1,264 @@
+desc:Microtonal Sieve Construction (Xenakis Sieve Quantizer, MPE Output)
+//tags: MIDI microtonal xenakis sieve theory quantizer mpe
+//
+// A sieve S is built from up to four modular congruence terms
+// T_k(n) = (n mod M_k == R_k), combined left-to-right with
+// UNION / INTERSECTION / DIFFERENCE, in the classical Xenakis
+// formalism (Formalized Music, ch. on Sieve Theory). The result
+// is a Boolean function over the integers n, sampled here at a
+// resolution of `edo` equal divisions of the octave, anchored at
+// `rootnote`. Incoming MIDI notes are quantized to the nearest n
+// for which S(n) is true; since sieve steps generally do not land
+// on 12-TET semitones, exact tuning is carried on a per-note MPE
+// pitch-bend channel (round-robin over MIDI channels 1-16).
+//
+// IMPORTANT: set your receiving synth's pitch bend range to match
+// the "Synth pitch bend range" slider, or tuning will be wrong.
+
+slider1:edo=12<1,96,1>EDO (divisions of the octave)
+slider2:rootnote=60<0,127,1>Root note (sieve index n=0)
+slider3:m1=2<0,32,1>Sieve term 1: modulus (0=off, base term)
+slider4:r1=0<0,31,1>Sieve term 1: residue
+slider5:m2=3<0,32,1>Sieve term 2: modulus (0=off)
+slider6:r2=0<0,31,1>Sieve term 2: residue
+slider7:op2=0<0,2,1{Union (OR),Intersection (AND),Difference (AND NOT)}>Sieve term 2: operator
+slider8:m3=0<0,32,1>Sieve term 3: modulus (0=off)
+slider9:r3=0<0,31,1>Sieve term 3: residue
+slider10:op3=0<0,2,1{Union (OR),Intersection (AND),Difference (AND NOT)}>Sieve term 3: operator
+slider11:m4=0<0,32,1>Sieve term 4: modulus (0=off)
+slider12:r4=0<0,31,1>Sieve term 4: residue
+slider13:op4=0<0,2,1{Union (OR),Intersection (AND),Difference (AND NOT)}>Sieve term 4: operator
+slider14:bendrange=2<1,48,1>Synth pitch bend range (semitones, must match receiving synth)
+slider15:searchradius=200<1,1000,1>Max quantization search radius (sieve steps)
+
+in_pin:none
+out_pin:none
+
+@init
+
+// ---- memory layout (base offsets into linear JSFX memory) ----
+note2chan    = 0;    // 128 slots: input note -> output channel (-1 = none)
+note2out     = 200;  // 128 slots: input note -> output note sent
+note2n       = 400;  // 128 slots: input note -> sieve index n sent
+chan_busy    = 600;  // 16 slots
+chan_outnote = 650;  // 16 slots
+chan_n       = 700;  // 16 slots: sieve index currently sounding on this channel
+
+i = 0;
+while (i < 128) (
+  note2chan[i] = -1;
+  note2out[i]  = -1;
+  note2n[i]    = 0;
+  i += 1;
+);
+i = 0;
+while (i < 16) (
+  chan_busy[i]    = 0;
+  chan_outnote[i] = -1;
+  chan_n[i]       = 0;
+  i += 1;
+);
+rrptr = 0;
+
+function gcd_i(a,b) local(t)
+(
+  a = abs(a); b = abs(b);
+  while (b > 0) (
+    t = b;
+    b = a % b;
+    a = t;
+  );
+  a;
+);
+
+function lcm_i(a,b) local(g)
+(
+  g = gcd_i(a,b);
+  g > 0 ? a*b/g : 0;
+);
+
+// Boolean sieve membership test for integer index n.
+// Term 1 is always the base (implicit union into the empty set).
+// Terms 2-4 combine via their own operator slider.
+function sieve_test(n) local(result,t)
+(
+  result = -1;
+  m1 >= 1 ? (
+    t = (((n % m1) + m1) % m1) == (((r1 % m1) + m1) % m1);
+    result = t;
+  );
+  m2 >= 1 ? (
+    t = (((n % m2) + m2) % m2) == (((r2 % m2) + m2) % m2);
+    result == -1 ? (
+      result = t;
+    ) : (
+      op2 == 0 ? result = (result || t) :
+      op2 == 1 ? result = (result && t) :
+                 result = (result && !t);
+    );
+  );
+  m3 >= 1 ? (
+    t = (((n % m3) + m3) % m3) == (((r3 % m3) + m3) % m3);
+    result == -1 ? (
+      result = t;
+    ) : (
+      op3 == 0 ? result = (result || t) :
+      op3 == 1 ? result = (result && t) :
+                 result = (result && !t);
+    );
+  );
+  m4 >= 1 ? (
+    t = (((n % m4) + m4) % m4) == (((r4 % m4) + m4) % m4);
+    result == -1 ? (
+      result = t;
+    ) : (
+      op4 == 0 ? result = (result || t) :
+      op4 == 1 ? result = (result && t) :
+                 result = (result && !t);
+    );
+  );
+  result == -1 ? 1 : result;
+);
+
+// Search outward from `target` (integer sieve index) for the
+// nearest n with sieve_test(n) true.
+function find_nearest_n(target) local(radius,found,cand)
+(
+  sieve_test(target) ? (
+    cand = target;
+  ) : (
+    radius = 1;
+    found = 0;
+    cand = target;
+    while (!found && radius <= searchradius) (
+      sieve_test(target - radius) ? (
+        cand = target - radius;
+        found = 1;
+      ) : (
+        sieve_test(target + radius) ? (
+          cand = target + radius;
+          found = 1;
+        );
+      );
+      radius += 1;
+    );
+  );
+  cand;
+);
+
+function handle_note_on(offset) local(target_n,n,floatnote,outnote,cents,bend,bendlsb,bendmsb,c,tries)
+(
+  target_n = floor((notenum - rootnote) * edo / 12 + 0.5);
+  n = find_nearest_n(target_n);
+  floatnote = rootnote + n * 12 / edo;
+  outnote = floor(floatnote + 0.5);
+  outnote = max(0, min(127, outnote));
+  cents = (floatnote - outnote) * 100;
+  bend = floor(8192 + cents / (bendrange * 100) * 8192 + 0.5);
+  bend = max(0, min(16383, bend));
+  bendlsb = bend & 127;
+  bendmsb = floor(bend / 128) & 127;
+
+  // round-robin MPE channel assignment (0-15 == MIDI ch 1-16)
+  c = rrptr;
+  tries = 0;
+  while (chan_busy[c] && tries < 16) (
+    c = (c + 1) % 16;
+    tries += 1;
+  );
+  chan_busy[c] ? (
+    midisend(offset, 0x80 | c, chan_outnote[c], 0); // steal: clean up stuck note
+  );
+  chan_busy[c] = 1;
+  chan_outnote[c] = outnote;
+  chan_n[c] = n;
+  rrptr = (c + 1) % 16;
+
+  note2chan[notenum] = c;
+  note2out[notenum] = outnote;
+  note2n[notenum] = n;
+
+  midisend(offset, 0xE0 | c, bendlsb, bendmsb);
+  midisend(offset, 0x90 | c, outnote, velocity);
+);
+
+function handle_note_off(offset) local(c,outnote)
+(
+  c = note2chan[notenum];
+  c >= 0 ? (
+    outnote = note2out[notenum];
+    midisend(offset, 0x80 | c, outnote, velocity);
+    chan_busy[c] = 0;
+    note2chan[notenum] = -1;
+  );
+);
+
+@slider
+
+period = 1;
+m1 >= 1 ? period = lcm_i(period, m1);
+m2 >= 1 ? period = lcm_i(period, m2);
+m3 >= 1 ? period = lcm_i(period, m3);
+m4 >= 1 ? period = lcm_i(period, m4);
+disp_period = period;
+
+@block
+
+while (midirecv(offset, msg1, msg2, msg3)) (
+  status = msg1 & 0xF0;
+  status == 0x90 && msg3 > 0 ? (
+    notenum = msg2;
+    velocity = msg3;
+    handle_note_on(offset);
+  ) : (
+    (status == 0x80) || (status == 0x90 && msg3 == 0) ? (
+      notenum = msg2;
+      velocity = msg3;
+      handle_note_off(offset);
+    ) : (
+      midisend(offset, msg1, msg2, msg3); // pass everything else through
+    );
+  );
+);
+
+@gfx 700 260
+
+gfx_r=gfx_g=gfx_b=1; gfx_a=1;
+gfx_x=10; gfx_y=8;
+sprintf(#txt,"EDO %d  |  Root %d  |  Sieve period (LCM) %d steps  |  Bend range +-%d st (match your synth!)",edo,rootnote,disp_period,bendrange);
+gfx_drawstr(#txt);
+
+lo = -2*edo;
+hi = 2*edo;
+total = hi - lo + 1;
+stepw = gfx_w / total;
+top = 40;
+h = 140;
+
+n = lo;
+while (n <= hi) (
+  active_here = 0;
+  cc = 0;
+  while (cc < 16) (
+    (chan_busy[cc] && chan_n[cc] == n) ? active_here = 1;
+    cc += 1;
+  );
+  isin = sieve_test(n);
+  n == 0 ? (
+    gfx_r=1; gfx_g=0.85; gfx_b=0.2;
+  ) : active_here ? (
+    gfx_r=0.2; gfx_g=1; gfx_b=0.4;
+  ) : isin ? (
+    gfx_r=0.3; gfx_g=0.6; gfx_b=1;
+  ) : (
+    gfx_r=0.15; gfx_g=0.15; gfx_b=0.18;
+  );
+  x = (n - lo) * stepw;
+  bh = isin ? h : h*0.35;
+  gfx_rect(x, top + (h-bh), stepw*0.85, bh);
+  n += 1;
+);
+
+gfx_r=gfx_g=gfx_b=0.6;
+gfx_x=10; gfx_y = top + h + 12;
+gfx_drawstr("Blue/tall = sieve step included | Gold = root (n=0) | Green = currently sounding | Dark = excluded");

@@ -1,0 +1,210 @@
+desc:CG Analyzer - live guitar analysis bus (pass-through)
+tags:analysis utility musique-concrete live
+slider1:1<1,4,1>Analysis Bus (1-4)
+slider2:6<2,18,0.1>Onset Sensitivity (dB)
+slider3:-55<-80,-20,0.5>Onset Floor (dB)
+slider4:70<20,400,1>Onset Refractory (ms)
+slider5:0<0,3,1{Auto,L,R,L+R}>Input
+
+in_pin:Input L
+in_pin:Input R
+out_pin:Output L
+out_pin:Output R
+options:gmem=CGbus no_meter
+
+@init
+
+ext_noinit=1;
+PI=3.141592653589793; TWOPI=6.283185307179586; CEIL=2;
+
+// ---- NaN-safe primitives. Comparisons with NaN are false, so every function below maps NaN/inf to a finite value ----
+function lim(x,lo,hi) ( x>=lo ? (x<=hi ? x : hi) : lo );
+function fin(x) ( abs(x)<100000 ? x : 0 );
+function db2lin(d) ( exp(lim(d,-120,60)*0.11512925464970229) );
+function dbgain(d) ( d<=-59.9 ? 0 : db2lin(d) );
+function lin2db(x) ( 8.685889638065035*log(abs(x)+0.000000001) );
+function sat(x) ( abs(x)<3 ? x*(27+x*x)/(27+9*x*x) : (x>0 ? 1 : -1) );
+function sclip(x,c) local(ax,k,y) ( ax=abs(x); k=c*0.7; y=ax<k ? ax : k+(c-k)*sat((ax-k)/(c-k)); x<0 ? -y : y );
+function mixf(a,b,t) ( a+(b-a)*t );
+function lpc(fc) ( 1-exp(-TWOPI*lim(fc,1,srate*0.45)/srate) );
+function smooth01(t) ( t<=0 ? 0 : (t>=1 ? 1 : t*t*(3-2*t)) );
+function rnd() ( rng=rng*1664525+1013904223; rng-=floor(rng/4294967296)*4294967296; rng/4294967296 );
+function rnds() ( rnd()*2-1 );
+function alloc(n) local(p) ( p=mp; mp+=n; memset(p,0,n); p );
+
+// ---- mono input pick (guitar usually lives on one channel) + DC block ----
+function pick_in() local(yy) (
+  eL+=(inL*inL-eL)*0.0005; eR+=(inR*inR-eR)*0.0005;
+  imode<0.5 ? ( xm = eR<0.0005*eL ? inL : (eL<0.0005*eR ? inR : (inL+inR)*0.5) )
+  : ( imode<1.5 ? ( xm=inL ) : ( imode<2.5 ? ( xm=inR ) : ( xm=(inL+inR)*0.5 ) ) );
+  yy=xm-dcx+dcr*dcy; dcx=xm; dcy=yy; xm=fin(yy);
+);
+
+// ---- onset detector (fast/slow envelope ratio with refractory time) ----
+function ons_proc(x) local(a) (
+  a=abs(x);
+  ons_f+=(a-ons_f)*(a>ons_f ? ons_kfa : ons_kfr);
+  ons_s+=(a-ons_s)*(a>ons_s ? ons_ksa : ons_ksr);
+  ons_ev=0;
+  ons_cool>0 ? ons_cool-=1;
+  (ons_cool<=0 && ons_f>ons_thr && ons_f>ons_s*ons_ratio) ? ( ons_ev=1; ons_cool=ons_refr; ons_cnt+=1; );
+);
+
+// ---- analysis bus (written by CG_Analyzer, optional for every other module) ----
+function bus_update() (
+  bus_b=(lim(floor(bus_sel+0.5),1,4)-1)*16;
+  hb=gmem[bus_b];
+  abs(hb-hb_last)>0.5 ? ( hb_last=hb; bus_stale=0; ) : ( bus_stale+=samplesblock; );
+  bus_alive=bus_stale<srate*0.4;
+);
+function bus_get(sel) ( (sel>0.5 && bus_alive) ? lim(gmem[bus_b+floor(sel+0.5)],0,1) : 0 );
+function bus_onset() local(c,r) ( r=0; bus_alive ? ( c=gmem[bus_b+10]; abs(c-bus_cnt_last)>0.5 ? ( r=1; bus_cnt_last=c; ); ); r );
+mp=0;
+
+function do_clear() ( 0; );
+function bar(x,y,w,v) ( gfx_set(0.15,0.15,0.2,1); gfx_rect(x,y,w,8); gfx_set(0.95,0.55,0.2,1); gfx_rect(x,y,w*lim(v,0,1),8); );
+function lab(x,y,s) ( gfx_set(0.8,0.8,0.85,1); gfx_x=x; gfx_y=y; gfx_drawstr(s); );
+
+a_ka=1-exp(-1/(0.001*srate)); a_kr=1-exp(-1/(0.04*srate));
+a_konsdec=exp(-1/(0.12*srate)); a_kdens=exp(-1/(2*srate));
+a_c250=lpc(250); a_c1k=lpc(1000); a_c4k=lpc(4000); a_cp=lpc(1100);
+a_k20=1-exp(-1/(0.02*srate)); a_k60=1-exp(-1/(0.06*srate));
+a_kpk=exp(-1/(0.15*srate));
+pmin=srate/1200; pmax=srate/65; phz=220; a_cent=0.3;
+
+function pitch_event() local(per,med,ok) (
+  per=pcnt; pcnt=0;
+  (per>=pmin && per<=pmax) ? (
+    ok=abs(per-h1)<0.07*h1;
+    med=max(min(per,h1),min(max(per,h1),h2));
+    h2=h1; h1=per;
+    pconf+=((ok ? 1 : 0)-pconf)*0.35;
+    ok ? ( phz+=(srate/max(med,1)-phz)*0.3; );
+  ) : ( pconf*=0.7; );
+);
+
+function analyze_ctl() local(db,tot,fl,cn,nz) (
+  db=lin2db(envf);
+  a_lv+=(lim((db+70)/70,0,1)-a_lv)*0.5;
+  tot=be0+be1+be2+be3;
+  tot>0.0003 ? (
+    cn=(be1*0.3333+be2*0.6667+be3)/tot;
+    a_cent+=(cn-a_cent)*0.25;
+    nz=0.6*lim(zcr_s*srate*0.5/5000,0,1)+0.4*lim(be3/tot*3,0,1);
+    a_noise+=(nz-a_noise)*0.2;
+    fl=max(be0-pb0,0)+max(be1-pb1,0)+max(be2-pb2,0)+max(be3-pb3,0);
+    a_flux+=(lim(fl/tot*8,0,1)-a_flux)*0.4;
+  ) : ( a_flux*=0.8; );
+  pb0=be0; pb1=be1; pb2=be2; pb3=be3;
+  pk_y>0.003 ? 0 : ( pconf*=0.9; );
+  a_pitchn=lim(log(max(phz,1)/65)/2.916,0,1);
+  a_dens=lim(dens/6,0,1);
+  ons_cnt>=1000000 ? ( ons_cnt=0; );
+  gmem[bus_b+1]=a_lv;
+  gmem[bus_b+2]=ons_env;
+  gmem[bus_b+3]=a_cent;
+  gmem[bus_b+4]=a_noise;
+  gmem[bus_b+5]=a_flux;
+  gmem[bus_b+6]=a_pitchn;
+  gmem[bus_b+7]=lim(pconf,0,1);
+  gmem[bus_b+8]=a_dens;
+  gmem[bus_b+9]=phz;
+  gmem[bus_b+10]=ons_cnt;
+);
+
+function read_params() (
+
+bus_sel=slider1; imode=slider5;
+ons_ratio=db2lin(lim(slider2,2,18));
+ons_thr=db2lin(lim(slider3,-80,-20));
+ons_refr=floor(lim(slider4,20,400)*0.001*srate);
+mod_t=0;
+
+);
+function copy_params() ( 0; );
+
+// ---- panic machine: fade wet out, clear every buffer, fade back in. Triggered by button or by internal watchdog ----
+function panic_step() (
+  (panic_req>0.5 && pan_ph==0) ? ( pan_ph=1; );
+  panic_req=0;
+  pan_ph==1 ? ( pan_g-=pan_dn; pan_g<=0 ? ( pan_g=0; do_clear(); pan_ph=2; pan_hold=floor(0.03*srate); ); );
+  pan_ph==2 ? ( pan_hold-=1; pan_hold<=0 ? ( pan_ph=3; ); );
+  pan_ph==3 ? ( pan_g+=pan_up; pan_g>=1 ? ( pan_g=1; pan_ph=0; ); );
+  pan_gs=pan_g*pan_g*(3-2*pan_g);
+);
+
+// ---- final stage: wet DC block, dry/wet sum, finite scrub, soft ceiling at +6 dB ----
+function finish() local(yy) (
+  wL=fin(wL); wR=fin(wR);
+  yy=wL-wxL+dcr*wyL; wxL=wL; wyL=yy; wL=yy;
+  yy=wR-wxR+dcr*wyR; wxR=wR; wyR=yy; wR=yy;
+  oL=sclip(fin(inL*P_dry+wL*P_wet*pan_gs),CEIL);
+  oR=sclip(fin(inR*P_dry+wR*P_wet*pan_gs),CEIL);
+  spl0=oL; spl1=oR;
+);
+
+smc=1-exp(-1/(0.015*srate));
+kmod=1-exp(-1/(0.004*srate));
+dcr=1-TWOPI*10/srate;
+pan_dn=1/(0.01*srate); pan_up=1/(0.05*srate); pan_g=1; pan_gs=1; pan_ph=0; panic_req=0;
+ons_kfa=1-exp(-1/(0.001*srate)); ons_kfr=1-exp(-1/(0.025*srate));
+ons_ksa=1-exp(-1/(0.040*srate)); ons_ksr=1-exp(-1/(0.250*srate));
+ons_ratio=2.2; ons_thr=db2lin(-52); ons_refr=floor(0.07*srate);
+bus_sel=1; imode=0; pfirst=1;
+rng=7001;
+
+@block
+
+bus_update();
+pan_btn=0; (pan_btn>0.5 && pan_prev<0.5) ? ( panic_req=1; ); pan_prev=pan_btn;
+read_params();
+pfirst ? ( copy_params(); pfirst=0; );
+
+gmem[bus_b]+=1; gmem[bus_b]>=1000000 ? ( gmem[bus_b]=1; );
+
+
+@sample
+
+inL=fin(spl0); inR=fin(spl1);
+pick_in();
+ons_proc(xm);
+panic_step();
+mod_s+=(mod_t-mod_s)*kmod;
+
+
+x=xm; ax=abs(x);
+envf+=(ax-envf)*(ax>envf ? a_ka : a_kr);
+ons_env = ons_ev ? 1 : ons_env*a_konsdec;
+dens*=a_kdens; ons_ev ? ( dens+=1; );
+lp1+=a_c250*(x-lp1); lp2+=a_c1k*(x-lp2); lp3+=a_c4k*(x-lp3);
+be0+=(abs(lp1)-be0)*a_k20; be1+=(abs(lp2-lp1)-be1)*a_k20;
+be2+=(abs(lp3-lp2)-be2)*a_k20; be3+=(abs(x-lp3)-be3)*a_k20;
+zc=0; ax>0.0005 ? ( ((x>0)!=(zprev>0)) ? ( zc=1; ); zprev=x; );
+zcr_s+=(zc-zcr_s)*a_k60;
+pl1+=a_cp*(x-pl1); pl2+=a_cp*(pl1-pl2); py=pl2;
+pk_y=max(abs(py),pk_y*a_kpk);
+pcnt<100000 ? ( pcnt+=1; );
+pthr=0.25*pk_y;
+(pk_y>0.003) ? (
+  (pst<0.5 && py>pthr) ? ( pst=1; pitch_event(); );
+  (pst>0.5 && py<-pthr) ? ( pst=0; );
+) : ( pst=0; );
+(ctl_cnt+=1)>=64 ? ( ctl_cnt=0; analyze_ctl(); );
+spl0=inL; spl1=inR;
+
+
+@gfx 560 300
+
+gfx_set(0.04,0.04,0.06,1); gfx_rect(0,0,gfx_w,gfx_h);
+lab(10,6,"CG ANALYZER  (bus publishes to other CG modules)");
+lab(10,34,"LEVEL");     bar(110,36,200,a_lv);
+lab(10,52,"ONSET");     bar(110,54,200,ons_env);
+lab(10,70,"BRIGHTNESS");bar(110,72,200,a_cent);
+lab(10,88,"NOISINESS"); bar(110,90,200,a_noise);
+lab(10,106,"FLUX");     bar(110,108,200,a_flux);
+lab(10,124,"PITCH");    bar(110,126,200,a_pitchn);
+lab(10,142,"PITCH CONF");bar(110,144,200,pconf);
+lab(10,160,"ONSET DENS");bar(110,162,200,a_dens);
+lab(330,34,"Hz"); gfx_x=360; gfx_y=34; gfx_drawnumber(phz,1);
+lab(330,52,"ONSETS"); gfx_x=390; gfx_y=52; gfx_drawnumber(ons_cnt,0);
+

@@ -1,0 +1,66 @@
+desc:CM Feedback Diffusion Network (Echo Chamber)
+// Concrete Music Suite -- multi-tap delay network with geometrically
+// spaced taps, per-tap stereo scatter, feedback, and HF damping.
+// Models the "echo chamber" transformation used at GRM (and other tape
+// studios) for diffusion/resonance treatment distinct from a simple
+// tape-loop echo -- closer to an artificial reverberant space built
+// from discrete reflections than a single feedback delay.
+
+slider1:numtaps=8<1,16,1>Number of Taps
+slider2:basedelay=250<10,2000,1>Base Delay (ms)
+slider3:spread=1.5<1,4,0.01>Tap Spacing Ratio
+slider4:feedback=0.4<0,0.98,0.001>Feedback
+slider5:damping=0.3<0,1,0.001>High-Frequency Damping
+slider6:diffusion=0.5<0,1,0.01>Stereo Diffusion
+slider7:mix=0.5<0,1,0.01>Wet/Dry Mix
+
+in_pin:Left
+in_pin:Right
+out_pin:Left
+out_pin:Right
+
+@init
+MAXTAPS = 16;
+MAXDELAY = srate*2.5;
+buf_L = 0;
+buf_R = buf_L + MAXDELAY;
+panbuf = buf_R + MAXDELAY;
+wpos = 0;
+damp_L = 0; damp_R = 0;
+rand(7);
+ti = 0;
+while (ti < MAXTAPS) (
+  panbuf[ti] = rand(1);
+  ti += 1;
+);
+
+@sample
+sumL = 0; sumR = 0;
+ti = 0;
+while (ti < numtaps) (
+  tapdelay = basedelay*0.001*srate * pow(spread, ti) / pow(spread, numtaps-1);
+  tapdelay < 1 ? tapdelay = 1;
+  tapdelay >= MAXDELAY ? tapdelay = MAXDELAY-1;
+  ridx = wpos - tapdelay;
+  ridx < 0 ? ridx += MAXDELAY;
+  idx0 = floor(ridx);
+  amp = 1/(ti+1);
+  p = panbuf[ti]*diffusion + 0.5*(1-diffusion);
+  sumL += buf_L[idx0]*amp*(1-p);
+  sumR += buf_R[idx0]*amp*p;
+  ti += 1;
+);
+
+damp_L += (sumL - damp_L)*(1-damping);
+damp_R += (sumR - damp_R)*(1-damping);
+
+inL = spl0 + damp_L*feedback;
+inR = spl1 + damp_R*feedback;
+
+buf_L[wpos] = inL;
+buf_R[wpos] = inR;
+wpos += 1;
+wpos >= MAXDELAY ? wpos = 0;
+
+spl0 = spl0*(1-mix) + sumL*mix;
+spl1 = spl1*(1-mix) + sumR*mix;

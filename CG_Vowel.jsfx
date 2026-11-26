@@ -1,0 +1,182 @@
+desc:CG Vowel - morphing 3-formant vocal filter driven by envelope / analysis
+tags:musique-concrete formant filter vowel live
+slider1:0<0,4,0.001>Vowel (A E I O U)
+slider2:1<0.5,2,0.001:log>Formant Scale
+slider3:12<2,40,0.1>Resonance (Q)
+slider4:3<0,24,0.1>Drive (dB)
+slider5:4<0,12,0.1>Makeup (dB)
+slider6:0.06<0,0.2,0.001>Stereo Formant Spread
+slider7:0<-4,4,0.01>Envelope -> Vowel
+slider8:60<5,1000,1:log>Vowel Glide (ms)
+slider9:0<-60,6,0.1>Wet (dB)
+slider10:-60<-60,6,0.1>Dry (dB)
+slider11:0<0,3,1{Auto,L,R,L+R}>Input
+slider12:1<1,4,1>Analysis Bus (1-4)
+slider13:0<0,6,1{None,Level,Onset,Brightness,Noisiness,Flux,Pitch}>Mod Source
+slider14:0<-4,4,0.01>Mod -> Vowel
+slider15:0<0,1,1{-,PANIC}>Panic / Clear
+
+in_pin:Input L
+in_pin:Input R
+out_pin:Output L
+out_pin:Output R
+options:gmem=CGbus no_meter
+
+@init
+
+ext_noinit=1;
+PI=3.141592653589793; TWOPI=6.283185307179586; CEIL=2;
+
+// ---- NaN-safe primitives. Comparisons with NaN are false, so every function below maps NaN/inf to a finite value ----
+function lim(x,lo,hi) ( x>=lo ? (x<=hi ? x : hi) : lo );
+function fin(x) ( abs(x)<100000 ? x : 0 );
+function db2lin(d) ( exp(lim(d,-120,60)*0.11512925464970229) );
+function dbgain(d) ( d<=-59.9 ? 0 : db2lin(d) );
+function lin2db(x) ( 8.685889638065035*log(abs(x)+0.000000001) );
+function sat(x) ( abs(x)<3 ? x*(27+x*x)/(27+9*x*x) : (x>0 ? 1 : -1) );
+function sclip(x,c) local(ax,k,y) ( ax=abs(x); k=c*0.7; y=ax<k ? ax : k+(c-k)*sat((ax-k)/(c-k)); x<0 ? -y : y );
+function mixf(a,b,t) ( a+(b-a)*t );
+function lpc(fc) ( 1-exp(-TWOPI*lim(fc,1,srate*0.45)/srate) );
+function smooth01(t) ( t<=0 ? 0 : (t>=1 ? 1 : t*t*(3-2*t)) );
+function rnd() ( rng=rng*1664525+1013904223; rng-=floor(rng/4294967296)*4294967296; rng/4294967296 );
+function rnds() ( rnd()*2-1 );
+function alloc(sz) local(p) ( p=mp; mp+=sz; memset(p,0,sz); p );
+
+// ---- mono input pick (guitar usually lives on one channel) + DC block ----
+function pick_in() local(yy) (
+  eL+=(inL*inL-eL)*0.0005; eR+=(inR*inR-eR)*0.0005;
+  imode<0.5 ? ( xm = eR<0.0005*eL ? inL : (eL<0.0005*eR ? inR : (inL+inR)*0.5) )
+  : ( imode<1.5 ? ( xm=inL ) : ( imode<2.5 ? ( xm=inR ) : ( xm=(inL+inR)*0.5 ) ) );
+  yy=xm-dcx+dcr*dcy; dcx=xm; dcy=yy; xm=fin(yy);
+);
+
+// ---- onset detector (fast/slow envelope ratio with refractory time) ----
+function ons_proc(x) local(a) (
+  a=abs(x);
+  ons_f+=(a-ons_f)*(a>ons_f ? ons_kfa : ons_kfr);
+  ons_s+=(a-ons_s)*(a>ons_s ? ons_ksa : ons_ksr);
+  ons_ev=0;
+  ons_cool>0 ? ons_cool-=1;
+  (ons_cool<=0 && ons_f>ons_thr && ons_f>ons_s*ons_ratio) ? ( ons_ev=1; ons_cool=ons_refr; ons_cnt+=1; );
+);
+
+// ---- analysis bus (written by CG_Analyzer, optional for every other module) ----
+function bus_update() (
+  bus_b=(lim(floor(bus_sel+0.5),1,4)-1)*16;
+  hb=gmem[bus_b];
+  abs(hb-hb_last)>0.5 ? ( hb_last=hb; bus_stale=0; ) : ( bus_stale+=samplesblock; );
+  bus_alive=bus_stale<srate*0.4;
+);
+function bus_get(sel) ( (sel>0.5 && bus_alive) ? lim(gmem[bus_b+floor(sel+0.5)],0,1) : 0 );
+function bus_onset() local(c,r) ( r=0; bus_alive ? ( c=gmem[bus_b+10]; abs(c-bus_cnt_last)>0.5 ? ( r=1; bus_cnt_last=c; ); ); r );
+mp=0;
+
+vt=alloc(15); st=alloc(12); fk=alloc(6);
+vt[0]=800;  vt[1]=1150; vt[2]=2900;
+vt[3]=400;  vt[4]=1600; vt[5]=2700;
+vt[6]=350;  vt[7]=1700; vt[8]=2700;
+vt[9]=450;  vt[10]=800; vt[11]=2830;
+vt[12]=325; vt[13]=700; vt[14]=2700;
+morph_t=0; morph_s=0; k_m=0.01; ef=0; lvl=0; ctl=0; envm=0; md_m=0; vgain=0.5;
+k_ea=1-exp(-1/(0.005*srate)); k_er=1-exp(-1/(0.1*srate));
+FMAXH=srate/8;
+
+function do_clear() ( memset(st,0,12); ef=0; );
+// Chamberlin state-variable bandpass, returns normalized band output
+function svf(o,f,q,x) local(lo,hi,bd) (
+  lo=o[0]+f*o[1];
+  hi=x-lo-q*o[1];
+  bd=o[1]+f*hi;
+  o[0]=lo; o[1]=lim(bd,-60,60);
+  bd*q
+);
+
+function read_params() (
+
+bus_sel=slider12; imode=slider11; msel=slider13;
+T_wet=dbgain(slider9); T_dry=dbgain(slider10);
+T_scale=lim(slider2,0.5,2); T_q=lim(slider3,2,40); T_drive=db2lin(lim(slider4,0,24));
+T_makeup=db2lin(lim(slider5,0,12)); T_spread=lim(slider6,0,0.2);
+envm=lim(slider7,-4,4); md_m=lim(slider14,-4,4); mod_t=bus_get(msel);
+morph_t=lim(slider1,0,4);
+k_m=1-exp(-1/(lim(slider8,5,1000)*0.001*srate*0.0625));   // per control tick (16 samples)
+
+);
+function copy_params() ( P_wet=T_wet; P_dry=T_dry; P_scale=T_scale; P_q=T_q; P_drive=T_drive; P_makeup=T_makeup; P_spread=T_spread; );
+
+// ---- panic machine: fade wet out, clear every buffer, fade back in. Triggered by button or by internal watchdog ----
+function panic_step() (
+  (panic_req>0.5 && pan_ph==0) ? ( pan_ph=1; );
+  panic_req=0;
+  pan_ph==1 ? ( pan_g-=pan_dn; pan_g<=0 ? ( pan_g=0; do_clear(); pan_ph=2; pan_hold=floor(0.03*srate); ); );
+  pan_ph==2 ? ( pan_hold-=1; pan_hold<=0 ? ( pan_ph=3; ); );
+  pan_ph==3 ? ( pan_g+=pan_up; pan_g>=1 ? ( pan_g=1; pan_ph=0; ); );
+  pan_gs=pan_g*pan_g*(3-2*pan_g);
+);
+
+// ---- final stage: wet DC block, dry/wet sum, finite scrub, soft ceiling at +6 dB ----
+function finish() local(yy) (
+  wL=fin(wL); wR=fin(wR);
+  yy=wL-wxL+dcr*wyL; wxL=wL; wyL=yy; wL=yy;
+  yy=wR-wxR+dcr*wyR; wxR=wR; wyR=yy; wR=yy;
+  oL=sclip(fin(inL*P_dry+wL*P_wet*pan_gs),CEIL);
+  oR=sclip(fin(inR*P_dry+wR*P_wet*pan_gs),CEIL);
+  spl0=oL; spl1=oR;
+);
+
+smc=1-exp(-1/(0.015*srate));
+kmod=1-exp(-1/(0.004*srate));
+dcr=1-TWOPI*10/srate;
+pan_dn=1/(0.01*srate); pan_up=1/(0.05*srate); pan_g=1; pan_gs=1; pan_ph=0; panic_req=0;
+ons_kfa=1-exp(-1/(0.001*srate)); ons_kfr=1-exp(-1/(0.025*srate));
+ons_ksa=1-exp(-1/(0.040*srate)); ons_ksr=1-exp(-1/(0.250*srate));
+ons_ratio=2.2; ons_thr=db2lin(-52); ons_refr=floor(0.07*srate);
+bus_sel=1; imode=0; pfirst=1;
+rng=7015;
+
+@block
+
+bus_update();
+pan_btn=slider15; (pan_btn>0.5 && pan_prev<0.5) ? ( panic_req=1; ); pan_prev=pan_btn;
+read_params();
+pfirst ? ( copy_params(); pfirst=0; );
+
+
+@sample
+
+inL=fin(spl0); inR=fin(spl1);
+pick_in();
+ons_proc(xm);
+panic_step();
+mod_s+=(mod_t-mod_s)*kmod;
+P_wet+=(T_wet-P_wet)*smc;
+P_dry+=(T_dry-P_dry)*smc;
+P_scale+=(T_scale-P_scale)*smc;
+P_q+=(T_q-P_q)*smc;
+P_drive+=(T_drive-P_drive)*smc;
+P_makeup+=(T_makeup-P_makeup)*smc;
+P_spread+=(T_spread-P_spread)*smc;
+
+ax=abs(xm); ef+=(ax-ef)*(ax>ef ? k_ea : k_er);
+(ctl+=1)>=16 ? (
+  ctl=0;
+  lvl=lim((lin2db(ef)+60)/60,0,1);
+  mt=lim(morph_t+envm*lvl+md_m*mod_s,0,4);
+  morph_s+=(mt-morph_s)*k_m;
+  m0=lim(floor(morph_s),0,3); mf=lim(morph_s-m0,0,1);
+  j=0;
+  while(j<3) (
+    fc=exp(mixf(log(vt[m0*3+j]),log(vt[(m0+1)*3+j]),mf))*P_scale;
+    fk[j]=2*sin(3.141592653589793*lim(fc*(1-P_spread),60,FMAXH)/srate);
+    fk[j+3]=2*sin(3.141592653589793*lim(fc*(1+P_spread),60,FMAXH)/srate);
+    j+=1;
+  );
+  qq=1/P_q;
+);
+x=sat(xm*P_drive*0.5)*2;
+yl=svf(st,fk[0],qq,x)+svf(st+2,fk[1],qq,x)*0.8+svf(st+4,fk[2],qq,x)*0.6;
+yr=svf(st+6,fk[3],qq,x)+svf(st+8,fk[4],qq,x)*0.8+svf(st+10,fk[5],qq,x)*0.6;
+wL=yl*P_makeup; wR=yr*P_makeup;
+(abs(wL)<20 && abs(wR)<20) ? 0 : ( panic_req=1; wL=0; wR=0; );
+finish();
+

@@ -1,0 +1,243 @@
+desc:Feedback FM Networks
+//------------------------------------------------------------------
+// FEEDBACK FM NETWORKS
+//
+// Six FM operators arranged not as a fixed algorithm (DX7-style stack)
+// but as a stochastically-generated feedback MATRIX: any operator can
+// modulate any other, plus itself. The matrix is regenerated from a
+// seeded PRNG whenever density/gain/seed change, so the topology
+// itself becomes a compositional object rather than a fixed patch.
+//
+// Feedback is resolved synchronously per-sample: operator i's
+// modulation input at sample n uses every operator's output from
+// sample n-1 (avoids solving an implicit system, and is the standard
+// trick used in real feedback-FM/feedback-delay-network designs).
+// Because the coupling is nonlinear (sin()) and the graph can contain
+// cycles, the system is free to fall into periodic, quasi-periodic,
+// or outright chaotic regimes depending on Feedback Gain and Density
+// -- closer to a small dynamical system than a conventional FM patch.
+//
+// A soft (Padé) tanh clipper keeps runaway feedback bounded so the
+// network can be pushed hard without blowing up numerically.
+//------------------------------------------------------------------
+
+slider1:220<20,2000,1>Base Frequency (Hz)
+slider2:1<0,1,1{Off,On}>Note Tracking
+slider3:6<2,6,1>Active Operators
+slider4:1<0.1,8,0.01>Op1 Ratio
+slider5:1.41<0.1,8,0.01>Op2 Ratio
+slider6:2<0.1,8,0.01>Op3 Ratio
+slider7:2.76<0.1,8,0.01>Op4 Ratio
+slider8:3.5<0.1,8,0.01>Op5 Ratio
+slider9:4.2<0.1,8,0.01>Op6 Ratio
+slider10:1<0,1,0.001>Op1 Level
+slider11:0.8<0,1,0.001>Op2 Level
+slider12:0.6<0,1,0.001>Op3 Level
+slider13:0.5<0,1,0.001>Op4 Level
+slider14:0.4<0,1,0.001>Op5 Level
+slider15:0.3<0,1,0.001>Op6 Level
+slider16:0.35<0,1,0.001>Feedback Density
+slider17:0.8<0,4,0.001>Feedback Gain
+slider18:0.4<0,2,0.001>Self-Feedback Amount
+slider19:1<1,999,1>Matrix Seed
+slider20:0.3<0,1,0.001>Saturation
+slider21:6<0,50,0.1>Stereo Detune (cents)
+slider22:0<-24,12,0.1>Output Gain (dB)
+
+in_pin:none
+out_pin:left output
+out_pin:right output
+
+@init
+// NOTE: user-defined functions must live inside @init (not in the
+// untagged preamble) to be callable from @slider/@block/@sample/@gfx --
+// functions defined before @init are local to that implicit section only.
+
+// cheap Padé approximant of tanh, avoids exp() overflow under heavy
+// feedback drive
+function tanh_ap(x)
+(
+  x = max(min(x,6),-6);
+  x*(27+x*x)/(27+9*x*x);
+);
+
+// process one channel's 6-operator network for one sample.
+// freq_off/phase_off/out_off/tmp_off are memory-offset "pointers".
+// out_off holds sample n-1 outputs on entry (used for feedback),
+// and is overwritten with sample n's outputs on exit.
+function fm_process(freq_off, phase_off, out_off, tmp_off)
+  local(i, j, modin, ph, o, drive, mix)
+(
+  i = 0;
+  mix = 0;
+  while (i < num_ops) (
+    modin = selffb[i] * out_off[i];
+    j = 0;
+    while (j < num_ops) (
+      modin += mtx[i*6+j] * out_off[j];
+      j += 1;
+    );
+    ph = phase_off[i] + freq_off[i];
+    ph >= twopi ? ph -= twopi;
+    o = sin(ph + modin);
+    sat_amt > 0 ? (
+      drive = 1 + sat_amt*4;
+      o = tanh_ap(o*drive) / tanh_ap(drive);
+    );
+    phase_off[i] = ph;
+    tmp_off[i] = o;
+    mix += lvl[i]*o;
+    i += 1;
+  );
+  i = 0;
+  while (i < num_ops) (
+    out_off[i] = tmp_off[i];
+    i += 1;
+  );
+  mix;
+);
+
+twopi = 2*$pi;
+
+// simple flat memory layout: 8-slot blocks per array (6 used, 2 spare)
+freqL_buf  = 0;
+freqR_buf  = 8;
+phaseL_buf = 16;
+phaseR_buf = 24;
+outL_buf   = 32;
+outR_buf   = 40;
+tmpL_buf   = 48;
+tmpR_buf   = 56;
+ratio_buf  = 64;
+lvl        = 72;
+selffb     = 80;
+mtx        = 88; // 6x6 = 36 slots, 88..123
+
+memset(0,0,132);
+
+note_freq   = 0;
+note_active = 0;
+cur_note    = -1;
+num_ops     = 6;
+
+@slider
+num_ops     = slider3|0;
+base_freq   = slider1;
+note_track  = slider2;
+density     = slider16;
+fbgain      = slider17;
+selffb_amt  = slider18;
+seed        = slider19|0;
+sat_amt     = slider20;
+detune_c    = slider21;
+outgain_lin = pow(10, slider22/20);
+
+ratio_buf[0]=slider4;  ratio_buf[1]=slider5;  ratio_buf[2]=slider6;
+ratio_buf[3]=slider7;  ratio_buf[4]=slider8;  ratio_buf[5]=slider9;
+
+lvl[0]=slider10; lvl[1]=slider11; lvl[2]=slider12;
+lvl[3]=slider13; lvl[4]=slider14; lvl[5]=slider15;
+
+// rebuild the feedback matrix from a seeded PRNG (LCG) --
+// deterministic per seed, so a given seed always reproduces the
+// same network topology
+prng_state = seed;
+i = 0;
+while (i < 6) (
+  selffb[i] = selffb_amt;
+  j = 0;
+  while (j < 6) (
+    i == j ? (
+      mtx[i*6+j] = 0;
+    ) : (
+      prng_state = (prng_state*1103515245 + 12345) & 0x7fffffff;
+      r1 = prng_state / 2147483647;
+      prng_state = (prng_state*1103515245 + 12345) & 0x7fffffff;
+      r2 = prng_state / 2147483647;
+      r1 < density ? (
+        mtx[i*6+j] = (r2*2 - 1) * fbgain;
+      ) : (
+        mtx[i*6+j] = 0;
+      );
+    );
+    j += 1;
+  );
+  i += 1;
+);
+
+@block
+while (midirecv(offset,msg1,msg2,msg3)) (
+  status = msg1 & 0xf0;
+  (status == 0x90 && msg3 > 0) ? (
+    cur_note = msg2;
+    note_freq = 440 * pow(2, (cur_note-69)/12);
+    note_active = 1;
+  );
+  (status == 0x80 || (status == 0x90 && msg3 == 0)) ? (
+    msg2 == cur_note ? note_active = 0;
+  );
+);
+
+use_freq = (note_track > 0.5 && note_freq > 0) ? note_freq : base_freq;
+detune_frac = (pow(2, detune_c/1200) - 1) * 0.5;
+
+i = 0;
+while (i < 6) (
+  f  = use_freq * ratio_buf[i];
+  fL = f * (1 - detune_frac);
+  fR = f * (1 + detune_frac);
+  freqL_buf[i] = twopi * fL / srate;
+  freqR_buf[i] = twopi * fR / srate;
+  i += 1;
+);
+
+@sample
+spl0 = fm_process(freqL_buf, phaseL_buf, outL_buf, tmpL_buf) * outgain_lin;
+spl1 = fm_process(freqR_buf, phaseR_buf, outR_buf, tmpR_buf) * outgain_lin;
+
+@gfx 420 320
+gfx_r=gfx_g=gfx_b=0.06; gfx_a=1; gfx_rect(0,0,gfx_w,gfx_h);
+cx = gfx_w*0.5; cy = gfx_h*0.52; rad = min(gfx_w,gfx_h)*0.34;
+
+i = 0;
+while (i < num_ops) (
+  ai = i*twopi/num_ops - $pi/2;
+  xi = cx + rad*cos(ai); yi = cy + rad*sin(ai);
+  j = 0;
+  while (j < num_ops) (
+    v = mtx[i*6+j];
+    v != 0 ? (
+      aj = j*twopi/num_ops - $pi/2;
+      xj = cx + rad*cos(aj); yj = cy + rad*sin(aj);
+      v > 0 ? (gfx_r=1; gfx_g=0.35; gfx_b=0.25;) : (gfx_r=0.3; gfx_g=0.55; gfx_b=1;);
+      gfx_a = min(abs(v),1)*0.75;
+      gfx_line(xi,yi,xj,yj);
+    );
+    j += 1;
+  );
+  i += 1;
+);
+
+i = 0;
+while (i < num_ops) (
+  ai = i*twopi/num_ops - $pi/2;
+  xi = cx + rad*cos(ai); yi = cy + rad*sin(ai);
+  amp = abs(outL_buf[i]);
+  gfx_a = 1; gfx_r = 0.2+0.8*amp; gfx_g = 0.6; gfx_b = 0.9-0.5*amp;
+  gfx_circle(xi,yi,6+amp*10,1,1);
+  selffb[i] > 0 ? (
+    gfx_r=1; gfx_g=1; gfx_b=0.4; gfx_a=0.5;
+    gfx_circle(xi,yi,10+selffb[i]*4,0,1);
+  );
+  gfx_a=1; gfx_r=gfx_g=gfx_b=1;
+  gfx_x = xi-3; gfx_y = yi-6;
+  gfx_drawnumber(i+1,0);
+  i += 1;
+);
+
+gfx_r=gfx_g=gfx_b=1; gfx_a=1;
+gfx_x=8; gfx_y=8;
+gfx_drawstr("Feedback FM Network  -  seed ");
+gfx_x=gfx_screenwidth; // no-op guard
+gfx_x=8+180; gfx_y=8;
+gfx_drawnumber(seed,0);

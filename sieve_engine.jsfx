@@ -1,0 +1,93 @@
+desc:Xenakis Sieve Engine - Sieve-based Pitch/Rhythm Generator
+slider1:m1=3<2,16,1>Modulus 1
+slider2:r1=0<0,15,1>Residue 1
+slider3:m2=4<2,16,1>Modulus 2
+slider4:r2=0<0,15,1>Residue 2
+slider5:op=0<0,1,1{Union,Intersection}>Combine Operation
+slider6:rootnote=60<0,127,1>Root MIDI Note
+slider7:rhythm_m=5<2,16,1>Rhythm Modulus
+slider8:rhythm_r=0<0,15,1>Rhythm Residue
+slider9:rate=4<0.5,16,0.01>Step Rate (Hz)
+
+@init
+RANGE = 48; // integer domain scanned for the sieve (roughly 4 octaves of steps)
+sieve = 0;
+freeidx = RANGE;
+rhythm = freeidx; freeidx += RANGE;
+scale = freeidx; freeidx += RANGE;
+scale_len = 0;
+phase = 0;
+step_idx = 0;
+scale_ptr = 0;
+gate_env = 0;
+cur_freq = 220;
+osc_phase = 0;
+
+// A "sieve" in Xenakis's sense is a logical combination (union/intersection)
+// of residual classes mod m. sieve_test(n) asks: does integer n belong to the
+// set defined by (mod m1 == r1) OP (mod m2 == r2)?
+function sieve_test(n, ma, ra, mb, rb, opsel)
+  local(a,b)
+(
+  a = (n%ma == ra);
+  b = (n%mb == rb);
+  opsel == 0 ? (a || b) : (a && b);
+);
+
+function build_sieves()
+  local(n, v)
+(
+  scale_len = 0;
+  n = 0;
+  while (n < RANGE) (
+    v = sieve_test(n, m1, r1, m2, r2, op);
+    sieve[n] = v;
+    v ? ( scale[scale_len] = n; scale_len += 1 );
+    // rhythm sieve is a single-modulus class used as an onset gate
+    rhythm[n] = sieve_test(n, rhythm_m, rhythm_r, rhythm_m, rhythm_r, 1);
+    n += 1;
+  );
+  scale_len == 0 ? ( scale[0] = 0; scale_len = 1 ); // guard: empty sieve fallback
+);
+
+// Binary entropy of sieve density - how "full" vs "sparse" the sieve is.
+// Ties directly into the entropy work: crossfade sieve-determined structure
+// against Markov-determined structure and watch this meter track the shift.
+function sieve_entropy()
+  local(ones, p, n)
+(
+  ones = 0; n = 0;
+  while (n < RANGE) ( ones += sieve[n]; n += 1 );
+  p = ones / RANGE;
+  (p <= 0 || p >= 1) ? 0 : ( -p*log(p)/log(2) - (1-p)*log(1-p)/log(2) );
+);
+
+build_sieves();
+
+@slider
+build_sieves();
+
+@sample
+// step clock advances through the rhythm sieve at `rate` Hz; each "on" step
+// in the rhythm domain triggers a new pitch drawn from the pitch-sieve scale
+phase += rate/srate;
+phase >= 1 ? (
+  phase -= 1;
+  step_idx = (step_idx + 1) % RANGE;
+  rhythm[step_idx] ? (
+    scale_ptr = (scale_ptr + 1) % scale_len;
+    cur_note = rootnote + scale[scale_ptr];
+    cur_freq = 440 * pow(2, (cur_note - 69)/12);
+    gate_env = 1;
+  );
+);
+
+gate_env *= 0.9995;
+osc_phase += cur_freq/srate;
+osc_phase -= floor(osc_phase);
+sig = sin(2*$pi*osc_phase) * gate_env * 0.4;
+
+spl0 = sig;
+spl1 = sig;
+
+ent = sieve_entropy(); // exposed for a future @gfx meter, same idea as your entropy article

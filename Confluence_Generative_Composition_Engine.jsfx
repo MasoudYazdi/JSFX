@@ -1,0 +1,578 @@
+desc:Confluence - Generative Composition Engine
+
+// =============================================================================
+// CONFLUENCE — a self-composing generative engine
+// -----------------------------------------------------------------------------
+// Architecture:
+//   CLOCK      -> samples-per-step derived from tempo/subdivision
+//   RHYTHM     -> Euclidean pattern (Bresenham-style bucket accumulator),
+//                 with a slow internal auto-rotation for gradual evolution
+//   PITCH      -> stochastic walk over scale degrees using a Box-Muller
+//                 gaussian step generator ("Markov Leap"/"Markov Stability"),
+//                 quantized against 8 modes, register-clamped
+//   ENGINES    -> per-note weighted-random choice of 5 synthesis techniques:
+//                   0 PolyBLEP subtractive (2x detuned bandlimited saws)
+//                   1 FM/Phase-Distortion pluck (decaying mod index)
+//                   2 Pulsar synthesis (Curtis Roads style pulsaret+formant)
+//                   3 Granular (internal rich wavetable OR live input capture)
+//                   4 Chaotic noise (logistic map through resonant SVF)
+//   MODULATION -> global logistic chaos map perturbs pulsar formant ratio
+//                 and master filter cutoff
+//   OUTPUT     -> chaos-modulated resonant SVF -> stereo ping-pong delay
+// =============================================================================
+
+in_pin:Live Input L
+in_pin:Live Input R
+out_pin:Output L
+out_pin:Output R
+
+slider1:tempo=96<40,220,1>Tempo (BPM)
+slider2:subdiv=4<1,8,1>Steps per Beat
+slider3:steps_n=16<3,32,1>Euclid Steps
+slider4:pulses_n=5<1,32,1>Euclid Pulses
+slider5:rot_n=0<0,31,1>Euclid Rotation
+slider6:density=85<0,100,1>Trigger Density %
+slider7:root_note=48<24,96,1>Root Note (MIDI)
+slider8:scale_mode=1<0,7,1{Major,Minor,Dorian,Phrygian,Lydian,Mixolydian,Locrian,Whole Tone}>Scale Mode
+slider9:spread_n=2<0,4,1>Register Spread (octaves)
+slider10:leap=35<0,100,1>Markov Leap Amount
+slider11:stability=15<0,100,1>Markov Stability %
+slider12:w_sub=30<0,100,1>Engine: Subtractive
+slider13:w_fm=25<0,100,1>Engine: FM / Phase Distortion
+slider14:w_pulsar=20<0,100,1>Engine: Pulsar
+slider15:w_gran=15<0,100,1>Engine: Granular
+slider16:w_chaos=10<0,100,1>Engine: Chaos Noise
+slider17:chaos_rate=6<0.1,50,0.1>Chaos Map Rate (Hz)
+slider18:chaos_depth=40<0,100,1>Chaos Modulation Depth %
+slider19:grain_ms=40<5,200,1>Grain / Texture Size (ms)
+slider20:cap_blend=0<0,100,1>Live Input Capture Blend %
+slider21:cutoff=4000<100,12000,1>Filter Cutoff (Hz)
+slider22:resonance=20<0,100,1>Filter Resonance %
+slider23:dly_ms=375<1,1500,1>Delay Time (ms)
+slider24:dly_fb_pct=35<0,95,1>Delay Feedback %
+slider25:vol_db=-6<-60,12,0.1>Master Volume (dB)
+
+@init
+
+// ---- field offsets into the per-voice record --------------------------
+FLD_ACTIVE  = 0;
+FLD_ENGINE  = 1;
+FLD_FREQ    = 2;
+FLD_PH1     = 3;
+FLD_PH2     = 4;
+FLD_ENVSTAGE= 5;
+FLD_ENVLEVEL= 6;
+FLD_ATK     = 7;
+FLD_PAN     = 8;
+FLD_AGE     = 9;
+FLD_MOD     = 10;
+FLD_PFORM   = 11;
+FLD_PREP    = 12;
+FLD_GPOS    = 13;
+FLD_GSIZE   = 14;
+FLD_GPITCH  = 15;
+FLD_CX      = 16;
+FLD_CR      = 17;
+FLD_FZ1     = 18;
+FLD_FZ2     = 19;
+FLD_DUR     = 20;
+FLD_DUTY    = 21;
+FLD_GCAP    = 22;
+FLD_REL     = 23;
+STRIDE      = 24;
+NUM_VOICES  = 12;
+wt_len      = 2048;
+
+// ---- manual memory allocator -------------------------------------------
+free_ptr = 0;
+function alloc(n) local(p) (
+  p = free_ptr;
+  free_ptr += n;
+  p;
+);
+
+// ---- utility functions ---------------------------------------------------
+function polyblep(t, dt) local(t2) (
+  t < dt ? (
+    t2 = t/dt;
+    2*t2 - t2*t2 - 1;
+  ) : t > 1-dt ? (
+    t2 = (t-1)/dt;
+    t2*t2 + 2*t2 + 1;
+  ) : 0;
+);
+
+function gauss_step(sigma) local(u1,u2) (
+  u1 = rand(1); u1 < 0.0005 ? u1 = 0.0005;
+  u2 = rand(1);
+  sqrt(-2*log(u1)) * cos(2*$pi*u2) * sigma;
+);
+
+function scale_freq(rmidi, degree, oct) local(base_degree, octshift, semis) (
+  base_degree = degree;
+  octshift = 0;
+  while (base_degree >= 7) ( base_degree -= 7; octshift += 1; );
+  while (base_degree < 0)  ( base_degree += 7; octshift -= 1; );
+  semis = scale_table[scale_mode_i*7 + base_degree] + 12*(octshift+oct);
+  440 * pow(2, (rmidi + semis - 69)/12);
+);
+
+function euclid_build() local(i, bucket, src_i) (
+  bucket = 0; i = 0;
+  loop(euclid_steps,
+    bucket += euclid_pulses;
+    bucket >= euclid_steps ? (
+      bucket -= euclid_steps;
+      euclid_pattern[i] = 1;
+    ) : (
+      euclid_pattern[i] = 0;
+    );
+    i += 1;
+  );
+
+  src_i = rot_n + auto_rot;
+  while (src_i >= euclid_steps) ( src_i -= euclid_steps; );
+
+  i = 0;
+  loop(euclid_steps,
+    euclid_tmp[i] = euclid_pattern[src_i];
+    src_i += 1;
+    src_i >= euclid_steps ? src_i = 0;
+    i += 1;
+  );
+  i = 0;
+  loop(euclid_steps,
+    euclid_pattern[i] = euclid_tmp[i];
+    i += 1;
+  );
+);
+
+function update_params() (
+  samples_per_step = srate*60/tempo/subdiv;
+  euclid_steps = floor(steps_n);
+  euclid_pulses = floor(pulses_n);
+  euclid_pulses > euclid_steps ? euclid_pulses = euclid_steps;
+  scale_mode_i = floor(scale_mode);
+  chaos_period = floor(srate/chaos_rate);
+  chaos_period < 1 ? chaos_period = 1;
+  chaos_depth_norm = chaos_depth*0.01;
+  grain_size_samp = floor(grain_ms*0.001*srate);
+  grain_size_samp < 16 ? grain_size_samp = 16;
+  dly_samples = floor(dly_ms*0.001*srate);
+  dly_samples < 1 ? dly_samples = 1;
+  dly_samples >= dly_len ? dly_samples = dly_len-1;
+  dly_fb = dly_fb_pct*0.01;
+  master_gain = pow(10, vol_db/20);
+  euclid_build();
+);
+
+function next_degree() local(r, step, sigma) (
+  r = rand(100);
+  r < stability ? (
+    step = 0;
+  ) : (
+    sigma = 1 + leap*0.06;
+    step = floor(gauss_step(sigma) + 0.5);
+    step == 0 ? step = (rand(2) < 1 ? -1 : 1);
+  );
+  cur_degree += step;
+  cur_degree > spread_i*7 ? cur_degree = spread_i*7;
+  cur_degree < -spread_i*7 ? cur_degree = -spread_i*7;
+  cur_degree;
+);
+
+function pick_engine() local(r, sum) (
+  sum = w_sub+w_fm+w_pulsar+w_gran+w_chaos;
+  sum <= 0 ? sum = 1;
+  r = rand(sum);
+  r < w_sub ? 0 : (
+    r -= w_sub;
+    r < w_fm ? 1 : (
+      r -= w_fm;
+      r < w_pulsar ? 2 : (
+        r -= w_pulsar;
+        r < w_gran ? 3 : 4;
+      );
+    );
+  );
+);
+
+function voice_alloc() local(v, chosen, oldest_v, oldest_age) (
+  v = 0; chosen = -1; oldest_v = 0; oldest_age = -1;
+  loop(NUM_VOICES,
+    voice_base[v*STRIDE+FLD_ACTIVE] == 0 && chosen < 0 ? chosen = v;
+    voice_base[v*STRIDE+FLD_AGE] > oldest_age ? (
+      oldest_age = voice_base[v*STRIDE+FLD_AGE];
+      oldest_v = v;
+    );
+    v += 1;
+  );
+  chosen >= 0 ? chosen : oldest_v;
+);
+
+function trigger_voice(v, eng, fr, durS) local(gpos) (
+  voice_base[v*STRIDE+FLD_ACTIVE]  = 1;
+  voice_base[v*STRIDE+FLD_ENGINE]  = eng;
+  voice_base[v*STRIDE+FLD_FREQ]    = fr;
+  voice_base[v*STRIDE+FLD_PH1]     = 0;
+  voice_base[v*STRIDE+FLD_PH2]     = rand(1);
+  voice_base[v*STRIDE+FLD_ENVSTAGE]= 1;
+  voice_base[v*STRIDE+FLD_ENVLEVEL]= 0;
+  voice_base[v*STRIDE+FLD_ATK]     = 0.003*srate;
+  voice_base[v*STRIDE+FLD_PAN]     = rand(2)-1;
+  voice_base[v*STRIDE+FLD_AGE]     = 0;
+  voice_base[v*STRIDE+FLD_MOD]     = 1 + rand(3);
+  voice_base[v*STRIDE+FLD_PFORM]   = 0;
+  voice_base[v*STRIDE+FLD_PREP]    = 0;
+
+  voice_base[v*STRIDE+FLD_GCAP] = (rand(100) < cap_blend) ? 1 : 0;
+  voice_base[v*STRIDE+FLD_GCAP] == 1 ? (
+    gpos = cap_write - rand(cap_len*0.5);
+    while (gpos < 0) ( gpos += cap_len; );
+  ) : (
+    gpos = rand(wt_len);
+  );
+  voice_base[v*STRIDE+FLD_GPOS]   = gpos;
+  voice_base[v*STRIDE+FLD_GSIZE]  = grain_size_samp;
+  voice_base[v*STRIDE+FLD_GPITCH] = 0.5 + rand(1.5);
+
+  voice_base[v*STRIDE+FLD_CX] = 0.2 + rand(0.6);
+  voice_base[v*STRIDE+FLD_CR] = 3.5 + rand(0.57);
+  voice_base[v*STRIDE+FLD_FZ1] = 0;
+  voice_base[v*STRIDE+FLD_FZ2] = 0;
+
+  voice_base[v*STRIDE+FLD_DUR]  = durS;
+  voice_base[v*STRIDE+FLD_DUTY] = 0.15 + rand(0.35);
+  voice_base[v*STRIDE+FLD_REL]  = eng==2 ? 0.02*srate : eng==3 ? 0.01*srate : 0.08*srate;
+);
+
+// ---- synthesis engines ---------------------------------------------------
+function synth_sub(v, freq) local(ph1,ph2,dt,detune,s1,s2) (
+  dt = freq/srate;
+  detune = 1.003;
+  ph1 = voice_base[v*STRIDE+FLD_PH1];
+  ph2 = voice_base[v*STRIDE+FLD_PH2];
+
+  s1 = 2*ph1 - 1 - polyblep(ph1, dt);
+  s2 = 2*ph2 - 1 - polyblep(ph2, dt*detune);
+
+  ph1 += dt;        ph1 >= 1 ? ph1 -= 1;
+  ph2 += dt*detune; ph2 >= 1 ? ph2 -= 1;
+
+  voice_base[v*STRIDE+FLD_PH1] = ph1;
+  voice_base[v*STRIDE+FLD_PH2] = ph2;
+
+  (s1+s2)*0.5;
+);
+
+function synth_fm(v, freq) local(ph1,ph2,idx,age,dur,ratio,out) (
+  ph1 = voice_base[v*STRIDE+FLD_PH1];
+  ph2 = voice_base[v*STRIDE+FLD_PH2];
+  age = voice_base[v*STRIDE+FLD_AGE];
+  dur = voice_base[v*STRIDE+FLD_DUR];
+  idx = voice_base[v*STRIDE+FLD_MOD] * exp(-age/(dur*0.5+1));
+  ratio = 2.0;
+
+  ph2 += (freq*ratio)/srate; ph2 >= 1 ? ph2 -= 1;
+  out = sin(2*$pi*(ph1 + idx*sin(2*$pi*ph2)));
+  ph1 += freq/srate; ph1 >= 1 ? ph1 -= 1;
+
+  voice_base[v*STRIDE+FLD_PH1] = ph1;
+  voice_base[v*STRIDE+FLD_PH2] = ph2;
+  out;
+);
+
+function synth_pulsar(v, freq) local(rep,form,duty,fratio,lp,w,out) (
+  rep  = voice_base[v*STRIDE+FLD_PREP];
+  form = voice_base[v*STRIDE+FLD_PFORM];
+  duty = voice_base[v*STRIDE+FLD_DUTY];
+  fratio = 3 + chaos_x*6;
+
+  rep += freq/srate;
+  rep >= 1 ? ( rep -= 1; form = 0; );
+
+  rep < duty ? (
+    lp = rep/duty;
+    w = pow(sin($pi*lp), 2);
+    out = sin(2*$pi*form) * w;
+    form += (freq*fratio)/srate;
+    form >= 1 ? form -= 1;
+  ) : (
+    out = 0;
+  );
+
+  voice_base[v*STRIDE+FLD_PREP]  = rep;
+  voice_base[v*STRIDE+FLD_PFORM] = form;
+  out;
+);
+
+function synth_gran(v) local(pos,pitch,use_cap,idx0,idx1,frac,src) (
+  pos     = voice_base[v*STRIDE+FLD_GPOS];
+  pitch   = voice_base[v*STRIDE+FLD_GPITCH];
+  use_cap = voice_base[v*STRIDE+FLD_GCAP];
+
+  use_cap == 1 ? (
+    idx0 = floor(pos); idx1 = idx0+1; idx1 >= cap_len ? idx1 = 0;
+    frac = pos - idx0;
+    src = cap_buf[idx0]*(1-frac) + cap_buf[idx1]*frac;
+    pos += pitch; pos >= cap_len ? pos -= cap_len;
+  ) : (
+    idx0 = floor(pos); idx1 = idx0+1; idx1 >= wt_len ? idx1 = 0;
+    frac = pos - idx0;
+    src = wt_buf[idx0]*(1-frac) + wt_buf[idx1]*frac;
+    pos += pitch; pos >= wt_len ? pos -= wt_len;
+  );
+
+  voice_base[v*STRIDE+FLD_GPOS] = pos;
+  src;
+);
+
+function synth_chaos(v, freq) local(x,r,raw,f,q,z1,z2,lp,hp,bp) (
+  x = voice_base[v*STRIDE+FLD_CX];
+  r = voice_base[v*STRIDE+FLD_CR];
+  x = r*x*(1-x);
+  x > 0.9999 ? x = 0.9999;
+  x < 0.0001 ? x = 0.0001;
+  voice_base[v*STRIDE+FLD_CX] = x;
+  raw = (x-0.5)*2.4;
+
+  z1 = voice_base[v*STRIDE+FLD_FZ1];
+  z2 = voice_base[v*STRIDE+FLD_FZ2];
+  f = 2*sin($pi*min(freq,srate*0.45)/srate);
+  q = 0.15;
+
+  lp = z2 + f*z1;
+  hp = raw - lp - q*z1;
+  bp = f*hp + z1;
+  z2 = lp; z1 = bp;
+
+  voice_base[v*STRIDE+FLD_FZ1] = z1;
+  voice_base[v*STRIDE+FLD_FZ2] = z2;
+  bp;
+);
+
+function process_voice(v) local(active,age,dur,atk,rel,env,eng,freq,sig,pan,panpos,gl,gr) (
+  active = voice_base[v*STRIDE+FLD_ACTIVE];
+  active == 1 ? (
+    age = voice_base[v*STRIDE+FLD_AGE] + 1;
+    voice_base[v*STRIDE+FLD_AGE] = age;
+    dur = voice_base[v*STRIDE+FLD_DUR];
+    atk = voice_base[v*STRIDE+FLD_ATK];
+    rel = voice_base[v*STRIDE+FLD_REL];
+
+    age < atk ? (
+      env = age/atk;
+    ) : age < dur ? (
+      env = 1;
+    ) : age < dur+rel ? (
+      env = 1 - (age-dur)/rel;
+    ) : (
+      env = 0;
+      voice_base[v*STRIDE+FLD_ACTIVE] = 0;
+    );
+    voice_base[v*STRIDE+FLD_ENVLEVEL] = env;
+
+    eng  = voice_base[v*STRIDE+FLD_ENGINE];
+    freq = voice_base[v*STRIDE+FLD_FREQ];
+
+    eng == 0 ? sig = synth_sub(v,freq)    :
+    eng == 1 ? sig = synth_fm(v,freq)     :
+    eng == 2 ? sig = synth_pulsar(v,freq) :
+    eng == 3 ? sig = synth_gran(v)        :
+                sig = synth_chaos(v,freq);
+
+    sig *= env * 0.35;
+
+    pan = voice_base[v*STRIDE+FLD_PAN];
+    panpos = (pan+1)*0.5;
+    gl = cos(panpos*$pi*0.5);
+    gr = sin(panpos*$pi*0.5);
+    mix_l += sig*gl;
+    mix_r += sig*gr;
+  );
+);
+
+// ---- allocate memory -------------------------------------------------
+scale_table  = alloc(56);
+wt_buf       = alloc(wt_len);
+euclid_pattern = alloc(32);
+euclid_tmp     = alloc(32);
+voice_base   = alloc(NUM_VOICES*STRIDE);
+cap_len = floor(srate*2);
+cap_buf = alloc(cap_len);
+dly_len = floor(srate*1.6);
+dly_buf_l = alloc(dly_len);
+dly_buf_r = alloc(dly_len);
+freembuf(free_ptr);
+
+// ---- fill scale table (semitone offsets per degree, 8 modes) -------------
+scale_table[0]=0;  scale_table[1]=2;  scale_table[2]=4;  scale_table[3]=5;  scale_table[4]=7;  scale_table[5]=9;  scale_table[6]=11; // Major
+scale_table[7]=0;  scale_table[8]=2;  scale_table[9]=3;  scale_table[10]=5; scale_table[11]=7; scale_table[12]=8; scale_table[13]=10; // Minor
+scale_table[14]=0; scale_table[15]=2; scale_table[16]=3; scale_table[17]=5; scale_table[18]=7; scale_table[19]=9; scale_table[20]=10; // Dorian
+scale_table[21]=0; scale_table[22]=1; scale_table[23]=3; scale_table[24]=5; scale_table[25]=7; scale_table[26]=8; scale_table[27]=10; // Phrygian
+scale_table[28]=0; scale_table[29]=2; scale_table[30]=4; scale_table[31]=6; scale_table[32]=7; scale_table[33]=9; scale_table[34]=11; // Lydian
+scale_table[35]=0; scale_table[36]=2; scale_table[37]=4; scale_table[38]=5; scale_table[39]=7; scale_table[40]=9; scale_table[41]=10; // Mixolydian
+scale_table[42]=0; scale_table[43]=1; scale_table[44]=3; scale_table[45]=5; scale_table[46]=6; scale_table[47]=8; scale_table[48]=10; // Locrian
+scale_table[49]=0; scale_table[50]=2; scale_table[51]=4; scale_table[52]=6; scale_table[53]=8; scale_table[54]=10; scale_table[55]=12; // Whole Tone
+
+// ---- fill internal wavetable: inharmonic additive spectrum + dust --------
+i = 0;
+loop(wt_len,
+  ph = i/wt_len;
+  s = sin(2*$pi*ph)*1.0;
+  s += sin(2*$pi*ph*2.01)*0.5;
+  s += sin(2*$pi*ph*3.98)*0.33;
+  s += sin(2*$pi*ph*5.03)*0.22;
+  s += sin(2*$pi*ph*7.9)*0.14;
+  s += (rand(2)-1)*0.03;
+  wt_buf[i] = s*0.3;
+  i += 1;
+);
+
+// ---- init state -----------------------------------------------------
+cur_degree = 0;
+auto_rot = 0;
+step_index = 0;
+clock_phase = 0;
+cap_write = 0;
+chaos_x = 0.4;
+chaos_r_g = 3.97;
+chaos_counter = 0;
+mf_z1_l = 0; mf_z2_l = 0; mf_z1_r = 0; mf_z2_r = 0;
+dly_write = 0;
+spread_i = 2;
+
+update_params();
+
+@slider
+spread_i = floor(spread_n);
+update_params();
+
+@sample
+
+// live input capture buffer (feeds the granular engine's "Live Input Capture Blend")
+cap_buf[cap_write] = (spl0+spl1)*0.5;
+cap_write += 1;
+cap_write >= cap_len ? cap_write = 0;
+
+// global chaos map, updated at chaos_rate
+chaos_counter += 1;
+chaos_counter >= chaos_period ? (
+  chaos_counter = 0;
+  chaos_x = chaos_r_g * chaos_x * (1-chaos_x);
+);
+
+// master clock / step sequencer
+clock_phase += 1;
+clock_phase >= samples_per_step ? (
+  clock_phase = 0;
+
+  euclid_pattern[step_index] == 1 && rand(100) < density ? (
+    degree = next_degree();
+    freq = scale_freq(root_note, degree, 0);
+    dur = samples_per_step * (1 + floor(rand(3)));
+    eng = pick_engine();
+    v = voice_alloc();
+    trigger_voice(v, eng, freq, dur);
+  );
+
+  step_index += 1;
+  step_index >= euclid_steps ? (
+    step_index = 0;
+    // slow evolving rhythmic development
+    rand(100) < 12 ? ( auto_rot += 1; euclid_build(); );
+  );
+);
+
+// synthesize all active voices
+mix_l = 0; mix_r = 0;
+v = 0;
+loop(NUM_VOICES,
+  process_voice(v);
+  v += 1;
+);
+
+// master state-variable filter, cutoff modulated by the chaos map
+cut_mod = cutoff * (1 + chaos_depth_norm*(chaos_x-0.5));
+cut_mod = max(min(cut_mod, srate*0.45), 40);
+mf_f = 2*sin($pi*cut_mod/srate);
+mf_q = 0.08 + (resonance*0.01)*1.2;
+
+mf_lp_l = mf_z2_l + mf_f*mf_z1_l;
+mf_hp_l = mix_l - mf_lp_l - mf_q*mf_z1_l;
+mf_bp_l = mf_f*mf_hp_l + mf_z1_l;
+mf_z2_l = mf_lp_l; mf_z1_l = mf_bp_l;
+
+mf_lp_r = mf_z2_r + mf_f*mf_z1_r;
+mf_hp_r = mix_r - mf_lp_r - mf_q*mf_z1_r;
+mf_bp_r = mf_f*mf_hp_r + mf_z1_r;
+mf_z2_r = mf_lp_r; mf_z1_r = mf_bp_r;
+
+out_l = mf_lp_l;
+out_r = mf_lp_r;
+
+// stereo ping-pong delay
+read_pos = dly_write - dly_samples;
+while (read_pos < 0) ( read_pos += dly_len; );
+d_l = dly_buf_l[read_pos];
+d_r = dly_buf_r[read_pos];
+
+dly_buf_l[dly_write] = out_l + d_r*dly_fb;
+dly_buf_r[dly_write] = out_r + d_l*dly_fb;
+dly_write += 1;
+dly_write >= dly_len ? dly_write = 0;
+
+out_l = out_l*0.8 + d_l*0.4;
+out_r = out_r*0.8 + d_r*0.4;
+
+spl0 = out_l * master_gain;
+spl1 = out_r * master_gain;
+
+@gfx 520 320
+
+function draw_wheel() local(cx,cy,rad,i,ang,x1,y1,on) (
+  cx = gfx_w*0.32; cy = gfx_h*0.52; rad = min(gfx_w,gfx_h)*0.26;
+  i = 0;
+  loop(euclid_steps,
+    ang = 2*$pi*i/euclid_steps - $pi/2;
+    x1 = cx + cos(ang)*rad;
+    y1 = cy + sin(ang)*rad;
+    on = euclid_pattern[i];
+    i == step_index ? (
+      gfx_set(1,0.9,0.3,1);
+    ) : on ? (
+      gfx_set(0.35,0.85,0.95,0.9);
+    ) : (
+      gfx_set(0.25,0.25,0.3,0.6);
+    );
+    gfx_circle(x1, y1, i==step_index ? 6 : 4, 1, 1);
+    i += 1;
+  );
+);
+
+gfx_set(0.9,0.9,0.95,1);
+gfx_x=10; gfx_y=8;
+gfx_drawstr("CONFLUENCE — generative composition engine");
+
+draw_wheel();
+
+vx = gfx_w*0.62; vy0 = 40; vh = 16;
+v = 0;
+loop(NUM_VOICES,
+  a = voice_base[v*STRIDE+FLD_ACTIVE];
+  e = voice_base[v*STRIDE+FLD_ENGINE];
+  lev = voice_base[v*STRIDE+FLD_ENVLEVEL];
+  a==1 ? gfx_set(0.3+e*0.14, 0.8-e*0.1, 0.6, 1) : gfx_set(0.2,0.2,0.22,1);
+  gfx_rect(vx, vy0+v*vh, 20+lev*140, vh-4);
+  v += 1;
+);
+
+gfx_set(0.6,0.9,0.4,0.85);
+gfx_x = vx; gfx_y = vy0+NUM_VOICES*vh+16;
+gfx_drawstr("chaos x:");
+gfx_x = vx+70;
+gfx_drawstr(sprintf(#chaosstr,"%.3f",chaos_x));
+
+gfx_set(0.7,0.7,0.75,0.7);
+gfx_x = 10; gfx_y = gfx_h-18;
+gfx_drawstr(sprintf(#degstr,"degree %d  step %d/%d",cur_degree,step_index+1,euclid_steps));

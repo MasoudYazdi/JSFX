@@ -1,0 +1,520 @@
+desc:Continuum — after De Natura Sonorum (Parmegiani-style concrete engine, MIDI-triggered)
+//------------------------------------------------------------------------
+// Polyphonic MIDI-triggered granular / inharmonic-resonance / ring-mod
+// processor built around the vocabulary of Bernard Parmegiani & the GRM.
+//
+// v3: fixed a real instability bug (see note below), added a DC blocker
+// and a safety limiter so the plugin can no longer blow up the track,
+// added smart presets, and set default output to 100% wet.
+//
+// -------------------------------------------------------------------
+// BUG THAT WAS CAUSING THE EXPLOSION / MUTE:
+// The resonant filter bank is a state-variable (Chamberlin) filter.
+// Its damping coefficient was `qcoef = 1/filt_q`, and filt_q could be
+// set up to 60 on the slider, giving qcoef as low as ~0.0166 — almost
+// no damping. Combined with the filter's *center frequency* being
+// continuously modulated by the random-walking mrw_filtspread, the
+// coefficient could momentarily land in an unstable region and the
+// filter's internal low/band state would runaway to huge or NaN
+// values. Because that state feeds back into itself every sample
+// (low[n] = low[n-1] + f*band[n-1], etc.), once it goes NaN/huge it
+// NEVER recovers on its own — that's why the track stayed dead/muted
+// until the plugin was reset, instead of just glitching briefly.
+// Fixed by: (1) flooring qcoef so the filter can't reach near-zero
+// damping, (2) clamping/soft-saturating the filter and delay states
+// every sample so a spike can't propagate forever, and (3) a DC
+// blocker + true peak limiter + hard sample clamp on the final output
+// as a last-resort safety net.
+// -------------------------------------------------------------------
+//
+// Input Modes (slider1):
+//   0 = Live Grain-Thru : continuously records audio input into a rolling
+//       buffer and granulates it (process any concrete source).
+//   1 = Internal Noise Source : self-generating, no audio input needed.
+//   2 = Frozen Buffer : stop capturing, granulate whatever is currently
+//       held (freeze & dissect a moment, Parmegiani-style).
+//
+// MIDI: note-on opens a voice (Attack→Decay→Sustain), note-off triggers
+// Release. Voice pitch sets grain playback rate relative to Base Note.
+// Up to 8 voices; new notes steal the oldest voice once full.
+//
+// Presets (slider21): pick one to instantly load a tuned combination of
+// all texture/envelope parameters. Selecting "Manual" leaves your own
+// slider settings untouched.
+//------------------------------------------------------------------------
+
+slider1:0<0,2,1{Live Grain-Thru,Internal Noise Source,Frozen Buffer}>Input Mode
+slider2:12<1,80,0.1>Grain Density (grains/sec, per voice)
+slider3:120<5,500,1>Grain Size (ms)
+slider4:7<0,24,0.1>Pitch Scatter (semitones, micro-detune)
+slider5:400<0,2000,1>Position Scatter (ms)
+slider6:0.3<0,1,0.01>Reverse Grain Probability
+slider7:800<50,3000,1>Filter Bank Spread (Hz)
+slider8:18<1,60,0.1>Filter Resonance (Q)
+slider9:180<20,2000,1>Ring Mod Freq (Hz)
+slider10:0.35<0,1,0.01>Ring Mod Amount
+slider11:0.25<0,1,0.01>Evolution Rate
+slider12:0.55<0,0.95,0.01>Feedback Amount
+slider13:340<10,1500,1>Feedback Delay Time (ms)
+slider14:1<0,1,0.01>Dry/Wet
+slider15:0<-24,12,0.1>Output Gain (dB)
+slider16:20<1,4000,1>Attack (ms)
+slider17:200<1,4000,1>Decay (ms)
+slider18:0.7<0,1,0.01>Sustain Level
+slider19:800<1,8000,1>Release (ms)
+slider20:60<0,127,1>Base Note (rate = 1x here)
+slider21:0<0,6,1{Manual,Écoute Métallique,Bande Renversée,Nuage Stochastique,Dérive Spectrale,Impact Sec,Continuum Profond}>Preset
+
+@init
+
+// ---- functions -------------------------------------------------------
+
+function safe(x) ( (x>4)||(x<-4)||(x!=x) ? 0 : x );
+
+// EEL2 has no built-in tanh() — implement via exp(), clamped to avoid overflow
+function sat(x) local(e)
+(
+  x = max(-15, min(15, x));
+  e = exp(2*x);
+  (e-1)/(e+1);
+);
+
+function read_buf(pos) local(i0,i1,frac)
+(
+  pos = pos % buf_len;
+  pos < 0 ? pos += buf_len;
+  i0 = floor(pos);
+  i1 = (i0+1) % buf_len;
+  frac = pos - i0;
+  buffer[i0]*(1-frac) + buffer[i1]*frac;
+);
+
+function read_delay(buf, pos, len) local(i0,i1,frac)
+(
+  pos = pos % len;
+  pos < 0 ? pos += len;
+  i0 = floor(pos);
+  i1 = (i0+1) % len;
+  frac = pos - i0;
+  buf[i0]*(1-frac) + buf[i1]*frac;
+);
+
+function spawn_grain(vidx) local(i,found,offset_samples,rate_semi,len_samples,panpos,note,base_rate)
+(
+  i=0; found=-1;
+  while(i < NUM_GRAINS && found<0) (
+    grains[i*GRAIN_SZ] == 0 ? found=i;
+    i+=1;
+  );
+  found >= 0 ? (
+    note = voices[vidx*VOICE_SZ+1];
+    base_rate = 2^((note-base_note)/12);
+
+    offset_samples = (rand(2)-1)*pos_scatter_ms*0.001*srate;
+    len_samples = max(64, mrw_size*0.001*srate*(0.7+rand(1)*0.6));
+    rate_semi = (rand(2)-1)*mrw_pitch;
+    panpos = rand(1);
+
+    grains[found*GRAIN_SZ+1] = write_ptr - offset_samples;
+    grains[found*GRAIN_SZ+2] = (rand(1) < reverse_prob ? -1 : 1) * base_rate * 2^(rate_semi/12);
+    grains[found*GRAIN_SZ+3] = len_samples;
+    grains[found*GRAIN_SZ+4] = 0;
+    grains[found*GRAIN_SZ+5] = cos(panpos*$pi*0.5);
+    grains[found*GRAIN_SZ+6] = sin(panpos*$pi*0.5);
+    grains[found*GRAIN_SZ+7] = (0.5+rand(1)*0.5) * voices[vidx*VOICE_SZ+2];
+    grains[found*GRAIN_SZ+8] = vidx;
+    grains[found*GRAIN_SZ]   = 1;
+  );
+);
+
+function find_free_voice() local(i,found)
+(
+  i=0; found=-1;
+  while(i<NUM_VOICES && found<0)(
+    voices[i*VOICE_SZ]==0 ? found=i;
+    i+=1;
+  );
+  found;
+);
+
+function steal_voice() local(i,oldest_i,oldest_val)
+(
+  oldest_i=0; oldest_val=voices[6];
+  i=1;
+  while(i<NUM_VOICES)(
+    voices[i*VOICE_SZ+6] < oldest_val ? ( oldest_val=voices[i*VOICE_SZ+6]; oldest_i=i; );
+    i+=1;
+  );
+  oldest_i;
+);
+
+function note_on(note,vel) local(v)
+(
+  v = find_free_voice();
+  v < 0 ? v = steal_voice();
+  note_counter += 1;
+  voices[v*VOICE_SZ]   = 1;
+  voices[v*VOICE_SZ+1] = note;
+  voices[v*VOICE_SZ+2] = vel/127;
+  voices[v*VOICE_SZ+3] = 1;
+  voices[v*VOICE_SZ+4] = 0;
+  voices[v*VOICE_SZ+5] = 0;
+  voices[v*VOICE_SZ+6] = note_counter;
+);
+
+function note_off(note) local(i)
+(
+  i=0;
+  while(i<NUM_VOICES)(
+    (voices[i*VOICE_SZ]==1 && voices[i*VOICE_SZ+1]==note && voices[i*VOICE_SZ+3]<4) ? voices[i*VOICE_SZ+3]=4;
+    i+=1;
+  );
+);
+
+function update_envelope(vidx) local(stage,level)
+(
+  stage = voices[vidx*VOICE_SZ+3];
+  level = voices[vidx*VOICE_SZ+4];
+  stage==1 ? (
+    level += atk_inc;
+    level >= 1 ? ( level=1; stage=2; );
+  ) : stage==2 ? (
+    level -= dec_inc;
+    level <= sustain_lvl ? ( level=sustain_lvl; stage=3; );
+  ) : stage==3 ? (
+    level = sustain_lvl;
+  ) : stage==4 ? (
+    level -= rel_inc;
+    level <= 0 ? ( level=0; stage=0; voices[vidx*VOICE_SZ]=0; );
+  );
+  voices[vidx*VOICE_SZ+3] = stage;
+  voices[vidx*VOICE_SZ+4] = level;
+);
+
+function apply_preset(p)
+(
+  p==1 ? ( // Écoute Métallique — inharmonic bell resonance
+    slider2=8; slider3=90; slider4=3; slider5=250; slider6=0.1;
+    slider7=1400; slider8=25; slider9=310; slider10=0.5; slider11=0.2;
+    slider12=0.4; slider13=280; slider15=0;
+    slider16=15; slider17=150; slider18=0.6; slider19=600;
+  );
+  p==2 ? ( // Bande Renversée — reversed-tape texture
+    slider2=6; slider3=350; slider4=2; slider5=900; slider6=0.85;
+    slider7=500; slider8=12; slider9=90; slider10=0.15; slider11=0.15;
+    slider12=0.5; slider13=500; slider15=0;
+    slider16=400; slider17=400; slider18=0.7; slider19=2500;
+  );
+  p==3 ? ( // Nuage Stochastique — dense Xenakis-style grain cloud
+    slider2=45; slider3=35; slider4=14; slider5=1200; slider6=0.4;
+    slider7=1800; slider8=15; slider9=500; slider10=0.25; slider11=0.6;
+    slider12=0.3; slider13=180; slider15=-2;
+    slider16=5; slider17=80; slider18=0.5; slider19=300;
+  );
+  p==4 ? ( // Dérive Spectrale — slow spectral drift, spacious
+    slider2=10; slider3=280; slider4=5; slider5=600; slider6=0.2;
+    slider7=1000; slider8=20; slider9=45; slider10=0.6; slider11=0.1;
+    slider12=0.75; slider13=900; slider15=-1;
+    slider16=800; slider17=600; slider18=0.65; slider19=3000;
+  );
+  p==5 ? ( // Impact Sec — short concrete percussive gesture
+    slider2=20; slider3=25; slider4=1; slider5=50; slider6=0.05;
+    slider7=600; slider8=10; slider9=220; slider10=0.1; slider11=0.3;
+    slider12=0.2; slider13=120; slider15=0;
+    slider16=2; slider17=60; slider18=0.1; slider19=150;
+  );
+  p==6 ? ( // Continuum Profond — deep sustained drone
+    slider2=5; slider3=450; slider4=2; slider5=1500; slider6=0.3;
+    slider7=300; slider8=30; slider9=25; slider10=0.3; slider11=0.08;
+    slider12=0.85; slider13=1200; slider15=-2;
+    slider16=1500; slider17=800; slider18=0.8; slider19=4000;
+  );
+);
+
+// ---- memory layout -----------------------------------------------------
+
+NUM_GRAINS = 24;
+GRAIN_SZ   = 9;      // 0 active,1 pos,2 rate,3 len,4 age,5 panL,6 panR,7 amp,8 voice_idx
+
+NUM_VOICES = 8;
+VOICE_SZ   = 7;       // 0 active,1 note,2 vel,3 env_stage,4 env_level,5 grain_timer,6 trigger_id
+
+buf_len   = floor(srate*4);
+buffer    = freemem; freemem += buf_len;
+
+grains    = freemem; freemem += NUM_GRAINS*GRAIN_SZ;
+voices    = freemem; freemem += NUM_VOICES*VOICE_SZ;
+
+wintable_size = 1024;
+wintable  = freemem; freemem += wintable_size+1;
+
+delaylen  = floor(srate*2);
+delayL    = freemem; freemem += delaylen;
+delayR    = freemem; freemem += delaylen;
+
+filtstate = freemem; freemem += 8;
+ratios    = freemem; freemem += 4;
+
+i=0;
+while(i <= wintable_size) (
+  wintable[i] = sin($pi*i/wintable_size)^2;
+  i += 1;
+);
+
+ratios[0]=1.0; ratios[1]=1.618; ratios[2]=2.142; ratios[3]=3.37;
+
+i=0; while(i < NUM_GRAINS) ( grains[i*GRAIN_SZ]=0; i+=1; );
+i=0; while(i < NUM_VOICES) ( voices[i*VOICE_SZ]=0; i+=1; );
+
+write_ptr = 0;
+ringphase = 0;
+dwrite    = 0;
+noise_lp  = 0;
+note_counter = 0;
+last_preset = -1;
+
+// output-stage safety state
+dcL_x1=0; dcL_y1=0; dcR_x1=0; dcR_y1=0;
+lim_gain = 1;
+lim_threshold = 0.95;
+
+mrw_density = slider2;      mrw_density_t     = slider2;
+mrw_size    = slider3;      mrw_size_t        = slider3;
+mrw_pitch   = slider4;      mrw_pitch_t       = slider4;
+mrw_filtspread = slider7;   mrw_filtspread_t  = slider7;
+mrw_ringfreq   = slider9;   mrw_ringfreq_t    = slider9;
+mrw_fb         = slider12;  mrw_fb_t          = slider12;
+
+evolve_counter = 0;
+
+@slider
+
+// apply a preset (if changed) BEFORE reading sliders into working vars,
+// so the rest of this block picks up the overridden values
+preset_sel = slider21;
+preset_sel != last_preset ? (
+  last_preset = preset_sel;
+  preset_sel > 0 ? apply_preset(preset_sel);
+);
+
+in_mode        = slider1;
+density        = slider2;
+grain_ms       = slider3;
+pitch_scatter  = slider4;
+pos_scatter_ms = slider5;
+reverse_prob   = slider6;
+filt_spread    = slider7;
+filt_q         = slider8;
+ring_freq      = slider9;
+ring_amt       = slider10;
+evo_rate       = slider11;
+fb_amt         = slider12;
+fb_time_ms     = slider13;
+dry_wet        = slider14;
+out_gain       = 10^(slider15/20);
+fb_delay_samples = fb_time_ms*0.001*srate;
+
+attack_ms  = slider16;
+decay_ms   = slider17;
+sustain_lvl = slider18;
+release_ms = slider19;
+base_note  = slider20;
+
+atk_inc = 1/max(1, attack_ms*0.001*srate);
+dec_inc = (1-sustain_lvl)/max(1, decay_ms*0.001*srate);
+rel_inc = 1/max(1, release_ms*0.001*srate);
+
+@block
+
+// ---- MIDI in -----------------------------------------------------------
+while (midirecv(offset, msg1, msg2, msg3)) (
+  status = msg1 & $xf0;
+  (status == $x90 && msg3 != 0) ? note_on(msg2, msg3);
+  (status == $x80 || (status == $x90 && msg3 == 0)) ? note_off(msg2);
+  midisend(offset, msg1, msg2, msg3);
+);
+
+// ---- macro random-walk (aleatoric evolution) ---------------------------
+evolve_counter += samplesblock;
+target_interval = max(srate*0.3, srate*3*(1-evo_rate));
+evolve_counter >= target_interval ? (
+  evolve_counter = 0;
+  mrw_density_t    = density*(0.3+rand(1)*1.4);
+  mrw_size_t       = grain_ms*(0.4+rand(1)*1.6);
+  mrw_pitch_t      = pitch_scatter*(rand(2)-1);
+  mrw_filtspread_t = filt_spread*(0.5+rand(1));
+  mrw_ringfreq_t   = ring_freq*(0.5+rand(1));
+  mrw_fb_t         = fb_amt*(0.6+rand(1)*0.5);
+);
+
+lerp_coef = 0.02;
+mrw_density    += (mrw_density_t    - mrw_density)    * lerp_coef;
+mrw_size       += (mrw_size_t       - mrw_size)       * lerp_coef;
+mrw_pitch      += (mrw_pitch_t      - mrw_pitch)      * lerp_coef;
+mrw_filtspread += (mrw_filtspread_t - mrw_filtspread) * lerp_coef;
+mrw_ringfreq   += (mrw_ringfreq_t   - mrw_ringfreq)   * lerp_coef;
+mrw_fb         += (mrw_fb_t         - mrw_fb)         * lerp_coef;
+
+@sample
+
+in_l = spl0; in_r = spl1;
+mono_in = (in_l+in_r)*0.5;
+
+// ---- source capture / internal generation -------------------------------
+in_mode < 1.5 ? (
+  in_mode < 0.5 ? (
+    buffer[write_ptr] = mono_in;
+  ) : (
+    noise_lp += (rand(2)-1 - noise_lp)*0.05;
+    buffer[write_ptr] = noise_lp*0.8;
+  );
+);
+write_ptr = (write_ptr+1) % buf_len;
+
+// ---- per-voice envelope + grain scheduling ------------------------------
+grain_interval = srate / max(0.5, mrw_density);
+vi = 0;
+while(vi < NUM_VOICES) (
+  voices[vi*VOICE_SZ] == 1 ? (
+    update_envelope(vi);
+    voices[vi*VOICE_SZ+5] -= 1;
+    voices[vi*VOICE_SZ+5] <= 0 ? (
+      spawn_grain(vi);
+      voices[vi*VOICE_SZ+5] = grain_interval*(0.5+rand(1));
+    );
+  );
+  vi += 1;
+);
+
+// ---- grain cloud summation -----------------------------------------------
+gL=0; gR=0;
+gi=0;
+while(gi < NUM_GRAINS) (
+  base = gi*GRAIN_SZ;
+  grains[base] == 1 ? (
+    pos  = grains[base+1];
+    rate = grains[base+2];
+    len  = grains[base+3];
+    age  = grains[base+4];
+
+    s = read_buf(pos);
+    widx = min(wintable_size, floor((age/len)*wintable_size));
+    w = wintable[widx];
+    env = voices[grains[base+8]*VOICE_SZ+4];
+    amp = grains[base+7]*w*env;
+
+    gL += s*amp*grains[base+5];
+    gR += s*amp*grains[base+6];
+
+    grains[base+1] = pos+rate;
+    grains[base+4] = age+1;
+    age+1 >= len ? grains[base] = 0;
+  );
+  gi += 1;
+);
+
+monosum = safe((gL+gR)*0.5);
+
+// ---- inharmonic resonant filter bank (bell/metal timbre) -----------------
+// NOTE: qcoef is floored below — this is the fix for the instability bug.
+filt_out = 0;
+fi = 0;
+while (fi < 4) (
+  fr = 220*ratios[fi] + mrw_filtspread*ratios[fi]*0.35;
+  fr = min(fr, srate*0.45);
+  fcoef = min(2*sin($pi*fr/srate), 1.9);
+  qcoef = max(1/filt_q, 0.06);   // damping floor: prevents near-zero-damping self-oscillation
+
+  low_i  = fi*2;
+  band_i = fi*2+1;
+
+  filtstate[low_i]  = safe(filtstate[low_i] + fcoef*filtstate[band_i]);
+  high = monosum - filtstate[low_i] - qcoef*filtstate[band_i];
+  filtstate[band_i] = safe(filtstate[band_i] + fcoef*high);
+
+  filt_out += filtstate[band_i]*0.5;
+  fi += 1;
+);
+filt_out = sat(filt_out);   // gentle saturation ceiling, also flatters the metallic tone
+
+// ---- ring modulation (slow-drifting carrier) ------------------------------
+ringphase += 2*$pi*mrw_ringfreq/srate;
+ringphase >= 2*$pi ? ringphase -= 2*$pi;
+carrier = cos(ringphase);
+processed = filt_out*(1-ring_amt) + (filt_out*carrier)*ring_amt;
+processed = sat(processed*1.15)*0.9;   // safety saturation before it enters the feedback delay
+
+// ---- cross-feedback delay network (spatial diffusion) ---------------------
+dl = read_delay(delayL, dwrite - fb_delay_samples, delaylen);
+dr = read_delay(delayR, dwrite - fb_delay_samples*1.17, delaylen);
+
+// feedback taps are saturated individually — this is what stops the
+// recursive delay loop from ever being able to build up to infinity
+delayL[dwrite] = safe(processed       + sat(dr*mrw_fb));
+delayR[dwrite] = safe(processed*0.9   + sat(dl*mrw_fb));
+dwrite = (dwrite+1) % delaylen;
+
+wetL = processed*0.5 + dl*0.5;
+wetR = processed*0.5 + dr*0.5;
+
+outL = in_l*(1-dry_wet) + wetL*dry_wet;
+outR = in_r*(1-dry_wet) + wetR*dry_wet;
+
+// ---- DC blocker (one-pole highpass, removes any DC bias from ring-mod /
+//      feedback before it hits gain/limiter) --------------------------------
+dcL_y = outL - dcL_x1 + 0.995*dcL_y1;
+dcL_x1 = outL; dcL_y1 = dcL_y;
+outL = dcL_y;
+
+dcR_y = outR - dcR_x1 + 0.995*dcR_y1;
+dcR_x1 = outR; dcR_y1 = dcR_y;
+outR = dcR_y;
+
+// ---- output gain + peak limiter + hard safety clamp ------------------------
+preL = outL*out_gain;
+preR = outR*out_gain;
+
+peak = max(abs(preL), abs(preR));
+target_gain = peak > lim_threshold ? lim_threshold/peak : 1;
+target_gain < lim_gain ? ( lim_gain += (target_gain-lim_gain)*0.6 ) : ( lim_gain += (target_gain-lim_gain)*0.01 );
+lim_gain = min(lim_gain, 1);
+
+spl0 = max(-1, min(1, preL*lim_gain));
+spl1 = max(-1, min(1, preR*lim_gain));
+
+@gfx 640 320
+gfx_r=gfx_g=gfx_b=1;
+gfx_x=10; gfx_y=8;
+gfx_drawstr("CONTINUUM — concrete / electroacoustic engine (MIDI)");
+gfx_y+=20;
+gfx_drawstr(sprintf(#s1,"density %.1f/s   size %.0fms   pitch ±%.1fst", mrw_density, mrw_size, mrw_pitch));
+gfx_y+=16;
+gfx_drawstr(sprintf(#s2,"filter spread %.0fHz   ring %.0fHz   feedback %.2f", mrw_filtspread, mrw_ringfreq, mrw_fb));
+gfx_y+=16;
+gfx_drawstr(sprintf(#s3,"ADSR  A:%.0fms D:%.0fms S:%.2f R:%.0fms  base note %.0f", attack_ms, decay_ms, sustain_lvl, release_ms, base_note));
+gfx_y+=16;
+gfx_drawstr(sprintf(#s4,"limiter gain %.2f", lim_gain));
+
+gfx_y+=14;
+vi=0;
+while(vi<NUM_VOICES)(
+  vy = gfx_y + vi*14;
+  gfx_x = 10;
+  lvl = voices[vi*VOICE_SZ+4];
+  active = voices[vi*VOICE_SZ];
+  gfx_r = active ? 0.3+0.7*lvl : 0.25; gfx_g=0.6; gfx_b=0.9;
+  gfx_rect(10, vy, 4+lvl*200, 8);
+  vi += 1;
+);
+
+gi=0;
+while(gi<NUM_GRAINS)(
+  base=gi*GRAIN_SZ;
+  grains[base]==1 ? (
+    gx = 260 + grains[base+5]*350;
+    gy = 90 + (grains[base+4]/grains[base+3])*180;
+    gfx_r=0.3+0.7*grains[base+6]; gfx_g=0.5; gfx_b=0.9;
+    gfx_circle(gx,gy,3,1,1);
+  );
+  gi+=1;
+);

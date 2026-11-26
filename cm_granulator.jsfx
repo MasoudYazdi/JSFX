@@ -1,0 +1,103 @@
+desc:CM Granulator (Fragmentation / Coupure)
+// Concrete Music Suite -- grain-cloud fragmentation of a live-recorded
+// buffer. Models the "coupure" (cutting) and fragmentation operations
+// used in tape-splice concrete composition: a sound object is broken
+// into short grains, redistributed in time, and reassembled with
+// independent position/pitch/pan scatter.
+
+slider1:grainsize=80<5,500,1>Grain Size (ms)
+slider2:density=20<1,100,1>Grain Density (grains/sec)
+slider3:position=0.5<0,1,0.001>Buffer Read Position
+slider4:posjitter=0.05<0,1,0.001>Position Jitter
+slider5:pitch=0<-24,24,0.01>Pitch (semitones)
+slider6:pitchjitter=0<0,12,0.01>Pitch Jitter (semitones)
+slider7:panjitter=1<0,1,0.01>Pan Spread
+slider8:record=1<0,1,1{Off,On}>Record Input
+slider9:buflen=10<1,20,0.1>Buffer Length (sec)
+
+in_pin:Left
+in_pin:Right
+out_pin:Left
+out_pin:Right
+
+@init
+NGRAINS = 32;
+maxbuf = srate*20;
+buf_L = 0;
+buf_R = buf_L + maxbuf;
+grains = buf_R + maxbuf;   // NGRAINS slots, 6 fields each:
+                           // 0 active, 1 read-pos, 2 age, 3 length, 4 speed, 5 pan
+writepos = 0;
+nextgrain_ctr = 0;
+rand(1);
+
+@slider
+buflen_samples = buflen*srate;
+buflen_samples >= maxbuf ? buflen_samples = maxbuf - 1;
+grainlen_samples = grainsize*0.001*srate;
+grainlen_samples < 4 ? grainlen_samples = 4;
+
+@block
+graininterval = srate / density;
+
+@sample
+record ? (
+  buf_L[writepos] = spl0;
+  buf_R[writepos] = spl1;
+);
+writepos += 1;
+writepos >= buflen_samples ? writepos = 0;
+
+nextgrain_ctr -= 1;
+nextgrain_ctr <= 0 ? (
+  nextgrain_ctr = graininterval;
+  gi = 0; found = -1;
+  while (gi < NGRAINS) (
+    g = grains + gi*6;
+    (g[0] == 0 && found < 0) ? found = gi;
+    gi += 1;
+  );
+  found >= 0 ? (
+    g = grains + found*6;
+    jitpos = position + (rand(2)-1)*posjitter;
+    jitpos < 0 ? jitpos = 0;
+    jitpos > 1 ? jitpos = 1;
+    g[0] = 1;
+    g[1] = jitpos * buflen_samples;
+    g[2] = 0;
+    g[3] = grainlen_samples;
+    semis = pitch + (rand(2)-1)*pitchjitter;
+    g[4] = pow(2, semis/12);
+    g[5] = 0.5 + (rand(2)-1)*0.5*panjitter;
+  );
+);
+
+outL = 0; outR = 0;
+gi = 0;
+while (gi < NGRAINS) (
+  g = grains + gi*6;
+  g[0] == 1 ? (
+    idx = floor(g[1]);
+    idx0 = idx % buflen_samples;
+    idx0 < 0 ? idx0 += buflen_samples;
+    idx1 = idx0 + 1;
+    idx1 >= buflen_samples ? idx1 = 0;
+    frac = g[1] - idx;
+    sL = buf_L[idx0]*(1-frac) + buf_L[idx1]*frac;
+    sR = buf_R[idx0]*(1-frac) + buf_R[idx1]*frac;
+
+    winphase = g[2]/g[3];
+    win = 0.5 - 0.5*cos(2*$pi*winphase);
+
+    outL += sL*win*(1-g[5]);
+    outR += sR*win*g[5];
+
+    g[1] += g[4];
+    g[2] += 1;
+    g[2] >= g[3] ? g[0] = 0;
+  );
+  gi += 1;
+);
+
+spl0 = outL;
+spl1 = outR;

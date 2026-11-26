@@ -1,0 +1,750 @@
+desc:FFT Suite - PV Bin Processor (SC-inspired)
+//-----------------------------------------------------------------------------
+// FFT SUITE  —  a phase-vocoder bin processor for JSFX/REAPER
+// Modeled on SuperCollider's UGens>FFT ("PV_") family:
+//   https://doc.sccode.org/Browse.html#UGens%3EFFT
+//
+// MODE MAP  (slider3 "PV Algorithm" — mode index : SC UGen(s) emulated)
+//   00  PV_Copy              — bypass / reference (no bin modification)
+//   01  PV_MagFreeze          — freeze the magnitude+phase spectrum on demand
+//   02  PV_MagAbove           — zero bins below a magnitude threshold
+//   03  PV_MagBelow           — zero bins above a magnitude threshold
+//   04  PV_MagClip            — clip magnitude to a ceiling, phase untouched
+//   05  PV_MagSquared         — raise magnitude to a variable power (drive)
+//   06  PV_MagSmear           — blur magnitude across neighboring bins
+//   07  PV_MagNoise           — multiply magnitude by per-bin random noise
+//   08  PV_MagShift           — shift + stretch the magnitude envelope only
+//   09  PV_BinShift           — shift complex bins (mag+phase) up/down, w/ interp
+//   10  PV_PhaseShift         — rotate every bin's phase by a constant angle
+//   11  PV_PhaseShift90/270   — quadrature phase rotation presets, blendable
+//   12  PV_Conj                — conjugate (negate) the imaginary component
+//   13  PV_BrickWall           — hard spectral gate above/below a cutoff bin
+//   14  PV_LocalMax            — keep only local magnitude peaks (peak-picking)
+//   15  PV_RandComb            — random sparse bin mask, held for N frames
+//   16  PV_RectComb/RectComb2  — periodic rectangular bin gating (teeth+duty)
+//   17  PV_Diffuser             — randomize/smear bin phase (frozen or live)
+//   18  PV_ConformalMap         — Mobius-style complex-plane bin transform
+//   19  PV_Onset (HainsworthFoote / JensenAndersen) — spectral-flux onset
+//        detector; transients get a boost and flash the GUI
+//   20  PV_Add       [dual]   — complex-add chain A + chain B
+//   21  PV_Mul       [dual]   — complex-multiply chain A * chain B (cross-synth)
+//   22  PV_MagMul    [dual]   — multiply magnitudes, keep each chain's own phase
+//   23  PV_Max       [dual]   — per-bin winner-take-all by magnitude (max)
+//   24  PV_Min       [dual]   — per-bin winner-take-all by magnitude (min)
+//   25  PV_CopyPhase [dual]   — classic vocoder: swap magnitude/phase pairing
+//   26  PV_BinWipe   [dual]   — crossfade low bins -> high bins between A/B
+//   27  PV_RandWipe  [dual]   — random per-bin crossfade between A/B, held
+//
+// [dual] modes use chain A = left input, chain B = right input (or, with
+// "Chain B Source" set to Mirror, chain B just mirrors chain A, so the
+// dual-chain modes degrade gracefully to a self-referential identity case
+// when you only have one source feeding the plugin).
+//
+// Every mode operates on bins 0..N/2 (DC..Nyquist); Hermitian symmetry is
+// re-imposed after every mode so the IFFT output is always real, regardless
+// of what a given algorithm does to the spectrum.
+//-----------------------------------------------------------------------------
+
+slider1:fftsize_idx=3<0,5,1{256,512,1024,2048,4096,8192}>FFT Size
+slider2:ovr_idx=1<0,2,1{2x hop (50 pct),4x hop (75 pct),8x hop (87.5 pct)}>Overlap
+slider3:mode=0<0,27,1{PV_Copy,PV_MagFreeze,PV_MagAbove,PV_MagBelow,PV_MagClip,PV_MagSquared,PV_MagSmear,PV_MagNoise,PV_MagShift,PV_BinShift,PV_PhaseShift,PV_PhaseShift90/270,PV_Conj,PV_BrickWall,PV_LocalMax,PV_RandComb,PV_RectComb/RectComb2,PV_Diffuser,PV_ConformalMap,PV_Onset(HF/JA),PV_Add[dual],PV_Mul[dual],PV_MagMul[dual],PV_Max[dual],PV_Min[dual],PV_CopyPhase[dual],PV_BinWipe[dual],PV_RandWipe[dual]}>PV Algorithm
+slider4:paramA=0.5<0,1,0.001>Param A
+slider5:paramB=0.5<0,1,0.001>Param B
+slider6:chainB_src=1<0,1,1{Mirror Chain A,Right Channel Input}>Chain B Source
+slider7:freeze=0<0,1,1{Off,On}>Freeze (PV_MagFreeze only)
+slider8:mix=1<0,1,0.001>Dry / Wet Mix
+slider9:outgain=1<0,4,0.001>Output Gain
+
+in_pin:left in
+in_pin:right in
+out_pin:left out
+out_pin:right out
+
+@init
+
+MAXFFT = 8192;
+
+freemem = 0;
+function alloc(n) local(p) ( p = freemem; freemem += n; p );
+
+fftA     = alloc(MAXFFT*2);
+fftB     = alloc(MAXFFT*2);
+inbufA   = alloc(MAXFFT);
+inbufB   = alloc(MAXFFT);
+outbufA  = alloc(MAXFFT);
+outbufB  = alloc(MAXFFT);
+win      = alloc(MAXFFT);
+
+snapA_re = alloc(MAXFFT/2+1);
+snapA_im = alloc(MAXFFT/2+1);
+snapB_re = alloc(MAXFFT/2+1);
+snapB_im = alloc(MAXFFT/2+1);
+dispmagA = alloc(MAXFFT/2+1);
+prevmagA = alloc(MAXFFT/2+1);
+freezeMagA = alloc(MAXFFT/2+1);
+freezePhA  = alloc(MAXFFT/2+1);
+combmask     = alloc(MAXFFT/2+1);
+diffPh       = alloc(MAXFFT/2+1);
+randwipe_mask= alloc(MAXFFT/2+1);
+
+rnd_state = 1;
+function lcg_next() (
+  rnd_state = rnd_state * 16807 % 2147483647;
+  rnd_state <= 0 ? rnd_state += 2147483647;
+  rnd_state / 2147483647;
+);
+
+function hann_sqrt(i,N) ( sqrt(0.5 - 0.5*cos(2*$pi*i/(N-1))) );
+
+function softclip(x) local(ax) (
+  ax = abs(x);
+  ax <= 1 ? ( x - x*x*x*0.333333333 ) : ( x >= 0 ? 0.666666667 : -0.666666667 );
+);
+
+function calc_ola_norm() local(i,k,sum,mid) (
+  mid = floor(fftsize/2);
+  sum = 0; k = -fftsize;
+  while (k <= fftsize) (
+    i = mid - k;
+    (i >= 0) && (i < fftsize) ? sum += win[i]*win[i];
+    k += hopsize;
+  );
+  sum <= 0.0000001 ? sum = 1;
+  1.0 / (sum * fftsize);
+);
+
+function setup_fft() local(i) (
+  fftsize = 256 * pow(2, fftsize_idx);
+  fftsize > MAXFFT ? fftsize = MAXFFT;
+  overlap_factor = pow(2, ovr_idx+1);
+  hopsize = floor(fftsize / overlap_factor);
+  hopsize < 1 ? hopsize = 1;
+  halfN = fftsize/2;
+
+  i = 0;
+  while (i < fftsize) ( win[i] = hann_sqrt(i, fftsize); i += 1; );
+
+  memset(inbufA, 0, fftsize);
+  memset(inbufB, 0, fftsize);
+  memset(outbufA, 0, fftsize);
+  memset(outbufB, 0, fftsize);
+  memset(prevmagA, 0, halfN+1);
+  memset(combmask, 0, halfN+1);
+  memset(randwipe_mask, 0, halfN+1);
+  memset(diffPh, 0, halfN+1);
+  memset(freezeMagA, 0, halfN+1);
+  memset(freezePhA, 0, halfN+1);
+
+  pos = 0;
+  hopcount = 0;
+  comb_ctr = 0;
+  rw_ctr = 0;
+  frozen_latched = 0;
+  ola_norm = calc_ola_norm();
+);
+
+//--------------------------------------------------------------------------
+// per-mode PV_ implementations — each reads the pre-FFT snapshot
+// (snapA_re/im, snapB_re/im, dispmagA) and writes results into fftA/fftB.
+//--------------------------------------------------------------------------
+
+function m00_copy() (
+  // PV_Copy : pass the analysis frame through unmodified (true no-op)
+  0;
+);
+
+function m01_magfreeze() local(i,mag,ph) (
+  freeze > 0.5 ? (
+    !frozen_latched ? (
+      i=0; while(i<=halfN)(
+        freezeMagA[i] = sqrt(snapA_re[i]*snapA_re[i] + snapA_im[i]*snapA_im[i]);
+        freezePhA[i]  = atan2(snapA_im[i], snapA_re[i]);
+        i+=1;
+      );
+      frozen_latched = 1;
+    );
+    i=0; while(i<=halfN)(
+      mag = freezeMagA[i]; ph = freezePhA[i];
+      fftA[2*i]=mag*cos(ph); fftA[2*i+1]=mag*sin(ph);
+      i+=1;
+    );
+  ) : ( frozen_latched = 0; );
+);
+
+function m02_magabove() local(i,th) (
+  th = paramA*paramA*fftsize*0.5;
+  i=0; while(i<=halfN)( dispmagA[i] < th ? ( fftA[2*i]=0; fftA[2*i+1]=0; ); i+=1; );
+);
+
+function m03_magbelow() local(i,th) (
+  th = paramA*paramA*fftsize*0.5;
+  i=0; while(i<=halfN)( dispmagA[i] > th ? ( fftA[2*i]=0; fftA[2*i+1]=0; ); i+=1; );
+);
+
+function m04_magclip() local(i,ph,th) (
+  th = 0.02 + paramA*fftsize*0.5;
+  i=0; while(i<=halfN)(
+    dispmagA[i] > th ? (
+      ph = atan2(snapA_im[i], snapA_re[i]);
+      fftA[2*i]=th*cos(ph); fftA[2*i+1]=th*sin(ph);
+    );
+    i+=1;
+  );
+);
+
+function m05_magsquared() local(i,mag,ph,expo,scale) (
+  expo = 1 + paramA*2;
+  scale = fftsize*0.5;
+  i=0; while(i<=halfN)(
+    dispmagA[i] > 0 ? (
+      ph = atan2(snapA_im[i], snapA_re[i]);
+      mag = pow(dispmagA[i]/scale, expo)*scale;
+      fftA[2*i]=mag*cos(ph); fftA[2*i+1]=mag*sin(ph);
+    );
+    i+=1;
+  );
+);
+
+function m06_magsmear() local(i,j,width,sum,cnt,mag,ph) (
+  width = 1+floor(paramA*20);
+  i=0; while(i<=halfN)(
+    sum=0; cnt=0; j=i-width;
+    while(j<=i+width)( (j>=0)&&(j<=halfN) ? ( sum+=dispmagA[j]; cnt+=1; ); j+=1; );
+    cnt>0 ? (
+      mag = sum/cnt;
+      ph = atan2(snapA_im[i], snapA_re[i]);
+      fftA[2*i]=mag*cos(ph); fftA[2*i+1]=mag*sin(ph);
+    );
+    i+=1;
+  );
+);
+
+function m07_magnoise() local(i,mag,ph,rnd) (
+  i=0; while(i<=halfN)(
+    mag = dispmagA[i];
+    ph = atan2(snapA_im[i], snapA_re[i]);
+    rnd = 1 + (lcg_next()*2-1)*paramA;
+    rnd<0?rnd=0;
+    mag*=rnd;
+    fftA[2*i]=mag*cos(ph); fftA[2*i+1]=mag*sin(ph);
+    i+=1;
+  );
+);
+
+function m08_magshift() local(i,j,shift,stretch,mag,ph) (
+  shift = (paramA-0.5)*halfN;
+  stretch = 0.25 + paramB*1.75;
+  i=0; while(i<=halfN)(
+    j = floor((i-shift)/stretch);
+    mag = (j>=0)&&(j<=halfN) ? dispmagA[j] : 0;
+    ph = atan2(snapA_im[i], snapA_re[i]);
+    fftA[2*i]=mag*cos(ph); fftA[2*i+1]=mag*sin(ph);
+    i+=1;
+  );
+);
+
+function m09_binshift() local(i,j,j2,shift,interp,frac,rA,iA) (
+  shift = (paramA-0.5)*2*halfN;
+  interp = paramB>0.5;
+  i=0; while(i<=halfN)(
+    interp ? (
+      j = floor(i-shift);
+      frac = (i-shift)-j;
+      j2 = j+1;
+      rA = ((j>=0)&&(j<=halfN)?snapA_re[j]:0)*(1-frac) + ((j2>=0)&&(j2<=halfN)?snapA_re[j2]:0)*frac;
+      iA = ((j>=0)&&(j<=halfN)?snapA_im[j]:0)*(1-frac) + ((j2>=0)&&(j2<=halfN)?snapA_im[j2]:0)*frac;
+    ) : (
+      j = floor(i-shift+0.5);
+      rA = (j>=0)&&(j<=halfN) ? snapA_re[j] : 0;
+      iA = (j>=0)&&(j<=halfN) ? snapA_im[j] : 0;
+    );
+    fftA[2*i]=rA; fftA[2*i+1]=iA;
+    i+=1;
+  );
+);
+
+function m10_phaseshift() local(i,mag,ph,rot) (
+  rot = (paramA-0.5)*2*$pi;
+  i=0; while(i<=halfN)(
+    mag = dispmagA[i];
+    ph = atan2(snapA_im[i], snapA_re[i]) + rot;
+    fftA[2*i]=mag*cos(ph); fftA[2*i+1]=mag*sin(ph);
+    i+=1;
+  );
+);
+
+function m11_phaseshift90() local(i,mag,ph,rot,blend) (
+  rot = paramA<0.5 ? $pi*0.5 : -$pi*0.5;
+  blend = paramB;
+  i=0; while(i<=halfN)(
+    mag = dispmagA[i];
+    ph = atan2(snapA_im[i], snapA_re[i]) + rot*blend;
+    fftA[2*i]=mag*cos(ph); fftA[2*i+1]=mag*sin(ph);
+    i+=1;
+  );
+);
+
+function m12_conj() local(i,blend) (
+  blend = paramA;
+  i=0; while(i<=halfN)(
+    fftA[2*i]=snapA_re[i];
+    fftA[2*i+1]=snapA_im[i]*(1-2*blend);
+    i+=1;
+  );
+);
+
+function m13_brickwall() local(i,cutoff,keephigh) (
+  cutoff = floor(paramA*halfN);
+  keephigh = paramB>=0.5;
+  i=0; while(i<=halfN)(
+    (keephigh ? i<cutoff : i>cutoff) ? ( fftA[2*i]=0; fftA[2*i+1]=0; );
+    i+=1;
+  );
+);
+
+function m14_localmax() local(i,j,radius,meanv,cnt,thr,ismax) (
+  radius = 1+floor(paramA*10);
+  thr = paramB*3;
+  i=0; while(i<=halfN)(
+    meanv=0; cnt=0; ismax=1; j=i-radius;
+    while(j<=i+radius)(
+      (j>=0)&&(j<=halfN)&&(j!=i) ? (
+        meanv+=dispmagA[j]; cnt+=1;
+        dispmagA[j] > dispmagA[i] ? ismax=0;
+      );
+      j+=1;
+    );
+    cnt>0 ? meanv/=cnt;
+    (!ismax) || (dispmagA[i] <= meanv*(1+thr)) ? ( fftA[2*i]=0; fftA[2*i+1]=0; );
+    i+=1;
+  );
+);
+
+function m15_randcomb() local(i,density,holdlen) (
+  density = paramA;
+  holdlen = 1+floor(paramB*30);
+  comb_ctr <= 0 ? (
+    comb_ctr = holdlen;
+    i=0; while(i<=halfN)( combmask[i] = lcg_next() < density ? 1 : 0; i+=1; );
+  ) : comb_ctr -= 1;
+  i=0; while(i<=halfN)( combmask[i]<0.5 ? ( fftA[2*i]=0; fftA[2*i+1]=0; ); i+=1; );
+);
+
+function m16_rectcomb() local(i,teeth,duty) (
+  teeth = 2+floor(paramA*30);
+  duty = 0.1+paramB*0.8;
+  i=0; while(i<=halfN)(
+    (i%teeth) >= (teeth*duty) ? ( fftA[2*i]=0; fftA[2*i+1]=0; );
+    i+=1;
+  );
+);
+
+function m17_diffuser() local(i,amt,hold,mag,ph) (
+  amt = paramA;
+  hold = paramB>0.5;
+  !hold ? ( i=0; while(i<=halfN)( diffPh[i] = (lcg_next()*2-1)*$pi; i+=1; ); );
+  i=0; while(i<=halfN)(
+    mag = dispmagA[i];
+    ph = atan2(snapA_im[i], snapA_re[i]) + diffPh[i]*amt;
+    fftA[2*i]=mag*cos(ph); fftA[2*i+1]=mag*sin(ph);
+    i+=1;
+  );
+);
+
+function m18_conformalmap() local(i,ar,ai,zr,zi,nr,ni,dr,di,den,rr,ri,scale) (
+  ar = (paramA-0.5)*2;
+  ai = (paramB-0.5)*2;
+  scale = fftsize*0.5;
+  i=0; while(i<=halfN)(
+    zr = snapA_re[i]/scale; zi = snapA_im[i]/scale;
+    nr = zr+ar; ni = zi+ai;
+    dr = 1+ar*zr+ai*zi;
+    di = ar*zi-ai*zr;
+    den = dr*dr+di*di;
+    den < 0.0000001 ? den = 0.0000001;
+    rr = (nr*dr+ni*di)/den;
+    ri = (ni*dr-nr*di)/den;
+    fftA[2*i]=rr*scale; fftA[2*i+1]=ri*scale;
+    i+=1;
+  );
+);
+
+function m19_onset() local(i,flux,thr,boost) (
+  flux=0;
+  i=0; while(i<=halfN)( dispmagA[i]>prevmagA[i] ? flux += (dispmagA[i]-prevmagA[i]); i+=1; );
+  thr = (1-paramA)*fftsize*4 + fftsize*0.5;
+  onsetFlag = flux > thr;
+  onsetFlag ? onsetFlash = 1;
+  boost = onsetFlag ? 1+paramB*3 : 1;
+  i=0; while(i<=halfN)( fftA[2*i]=snapA_re[i]*boost; fftA[2*i+1]=snapA_im[i]*boost; i+=1; );
+  i=0; while(i<=halfN)( prevmagA[i]=dispmagA[i]; i+=1; );
+);
+
+function m20_add() local(i) (
+  i=0; while(i<=halfN)(
+    fftA[2*i]=snapA_re[i]+snapB_re[i]; fftA[2*i+1]=snapA_im[i]+snapB_im[i];
+    fftB[2*i]=fftA[2*i]; fftB[2*i+1]=fftA[2*i+1];
+    i+=1;
+  );
+);
+
+function m21_mul() local(i,scale,re,im) (
+  scale = 1/(fftsize*0.5);
+  i=0; while(i<=halfN)(
+    re = (snapA_re[i]*snapB_re[i]-snapA_im[i]*snapB_im[i])*scale;
+    im = (snapA_re[i]*snapB_im[i]+snapA_im[i]*snapB_re[i])*scale;
+    fftA[2*i]=re; fftA[2*i+1]=im; fftB[2*i]=re; fftB[2*i+1]=im;
+    i+=1;
+  );
+);
+
+function m22_magmul() local(i,magA,magB,phA,phB,mag,scale) (
+  scale = 1/(fftsize*0.5);
+  i=0; while(i<=halfN)(
+    magA = dispmagA[i];
+    magB = sqrt(snapB_re[i]*snapB_re[i]+snapB_im[i]*snapB_im[i]);
+    mag = magA*magB*scale;
+    phA = atan2(snapA_im[i],snapA_re[i]);
+    phB = atan2(snapB_im[i],snapB_re[i]);
+    fftA[2*i]=mag*cos(phA); fftA[2*i+1]=mag*sin(phA);
+    fftB[2*i]=mag*cos(phB); fftB[2*i+1]=mag*sin(phB);
+    i+=1;
+  );
+);
+
+function m23_max() local(i,magB) (
+  i=0; while(i<=halfN)(
+    magB = sqrt(snapB_re[i]*snapB_re[i]+snapB_im[i]*snapB_im[i]);
+    dispmagA[i]>=magB ? ( fftA[2*i]=snapA_re[i]; fftA[2*i+1]=snapA_im[i]; )
+                      : ( fftA[2*i]=snapB_re[i]; fftA[2*i+1]=snapB_im[i]; );
+    fftB[2*i]=fftA[2*i]; fftB[2*i+1]=fftA[2*i+1];
+    i+=1;
+  );
+);
+
+function m24_min() local(i,magB) (
+  i=0; while(i<=halfN)(
+    magB = sqrt(snapB_re[i]*snapB_re[i]+snapB_im[i]*snapB_im[i]);
+    dispmagA[i]<=magB ? ( fftA[2*i]=snapA_re[i]; fftA[2*i+1]=snapA_im[i]; )
+                      : ( fftA[2*i]=snapB_re[i]; fftA[2*i+1]=snapB_im[i]; );
+    fftB[2*i]=fftA[2*i]; fftB[2*i+1]=fftA[2*i+1];
+    i+=1;
+  );
+);
+
+function m25_copyphase() local(i,magA,magB,phA,phB) (
+  i=0; while(i<=halfN)(
+    magA = dispmagA[i];
+    magB = sqrt(snapB_re[i]*snapB_re[i]+snapB_im[i]*snapB_im[i]);
+    phA = atan2(snapA_im[i],snapA_re[i]);
+    phB = atan2(snapB_im[i],snapB_re[i]);
+    fftA[2*i]=magA*cos(phB); fftA[2*i+1]=magA*sin(phB);
+    fftB[2*i]=magB*cos(phA); fftB[2*i+1]=magB*sin(phA);
+    i+=1;
+  );
+);
+
+function m26_binwipe() local(i,wipe,transw,t) (
+  wipe = paramA*halfN;
+  transw = 1+paramB*40;
+  i=0; while(i<=halfN)(
+    t = (i-wipe)/transw + 0.5;
+    t<0?t=0; t>1?t=1;
+    fftA[2*i]   = snapA_re[i]*(1-t) + snapB_re[i]*t;
+    fftA[2*i+1] = snapA_im[i]*(1-t) + snapB_im[i]*t;
+    fftB[2*i]=fftA[2*i]; fftB[2*i+1]=fftA[2*i+1];
+    i+=1;
+  );
+);
+
+function m27_randwipe() local(i,frac,holdlen) (
+  frac = paramA;
+  holdlen = 1+floor(paramB*30);
+  rw_ctr <= 0 ? (
+    rw_ctr = holdlen;
+    i=0; while(i<=halfN)( randwipe_mask[i] = lcg_next() < frac ? 1 : 0; i+=1; );
+  ) : rw_ctr -= 1;
+  i=0; while(i<=halfN)(
+    randwipe_mask[i]>0.5 ? ( fftA[2*i]=snapB_re[i]; fftA[2*i+1]=snapB_im[i]; )
+                         : ( fftA[2*i]=snapA_re[i]; fftA[2*i+1]=snapA_im[i]; );
+    fftB[2*i]=fftA[2*i]; fftB[2*i+1]=fftA[2*i+1];
+    i+=1;
+  );
+);
+
+function process_mode() local(i) (
+  i=0; while(i<=halfN)(
+    snapA_re[i]=fftA[2*i]; snapA_im[i]=fftA[2*i+1];
+    snapB_re[i]=fftB[2*i]; snapB_im[i]=fftB[2*i+1];
+    dispmagA[i]=sqrt(snapA_re[i]*snapA_re[i]+snapA_im[i]*snapA_im[i]);
+    i+=1;
+  );
+
+  mode==0 ? m00_copy() :
+  mode==1 ? m01_magfreeze() :
+  mode==2 ? m02_magabove() :
+  mode==3 ? m03_magbelow() :
+  mode==4 ? m04_magclip() :
+  mode==5 ? m05_magsquared() :
+  mode==6 ? m06_magsmear() :
+  mode==7 ? m07_magnoise() :
+  mode==8 ? m08_magshift() :
+  mode==9 ? m09_binshift() :
+  mode==10 ? m10_phaseshift() :
+  mode==11 ? m11_phaseshift90() :
+  mode==12 ? m12_conj() :
+  mode==13 ? m13_brickwall() :
+  mode==14 ? m14_localmax() :
+  mode==15 ? m15_randcomb() :
+  mode==16 ? m16_rectcomb() :
+  mode==17 ? m17_diffuser() :
+  mode==18 ? m18_conformalmap() :
+  mode==19 ? m19_onset() :
+  mode==20 ? m20_add() :
+  mode==21 ? m21_mul() :
+  mode==22 ? m22_magmul() :
+  mode==23 ? m23_max() :
+  mode==24 ? m24_min() :
+  mode==25 ? m25_copyphase() :
+  mode==26 ? m26_binwipe() :
+             m27_randwipe();
+
+  mode!=19 ? ( i=0; while(i<=halfN)( prevmagA[i]=dispmagA[i]; i+=1; ); );
+);
+
+function hermitian_fix(buf) local(i) (
+  buf[1] = 0;
+  buf[2*halfN+1] = 0;
+  i = 1;
+  while (i < halfN) (
+    buf[2*(fftsize-i)]   = buf[2*i];
+    buf[2*(fftsize-i)+1] = -buf[2*i+1];
+    i += 1;
+  );
+);
+
+function do_frame() local(i,idx) (
+  i = 0;
+  while (i < fftsize) (
+    idx = pos + i; idx >= fftsize ? idx -= fftsize;
+    fftA[2*i] = inbufA[idx] * win[i];
+    fftA[2*i+1] = 0;
+    i += 1;
+  );
+  i = 0;
+  while (i < fftsize) (
+    idx = pos + i; idx >= fftsize ? idx -= fftsize;
+    fftB[2*i] = inbufB[idx] * win[i];
+    fftB[2*i+1] = 0;
+    i += 1;
+  );
+
+  fft(fftA, fftsize);   fft_permute(fftA, fftsize);
+  fft(fftB, fftsize);   fft_permute(fftB, fftsize);
+
+  process_mode();
+
+  hermitian_fix(fftA);
+  hermitian_fix(fftB);
+
+  fft_ipermute(fftA, fftsize);  ifft(fftA, fftsize);
+  fft_ipermute(fftB, fftsize);  ifft(fftB, fftsize);
+
+  i = 0;
+  while (i < fftsize) (
+    idx = pos + i; idx >= fftsize ? idx -= fftsize;
+    outbufA[idx] += fftA[2*i] * win[i];
+    outbufB[idx] += fftB[2*i] * win[i];
+    i += 1;
+  );
+);
+
+fftsize_idx_prev = fftsize_idx;
+ovr_idx_prev = ovr_idx;
+mode_prev = mode;
+dual = chainB_src > 0.5;
+xfade_env = 1;
+wet_smooth = mix;
+gain_smooth = outgain;
+onsetFlag = 0;
+onsetFlash = 0;
+lbtn_prev = 0;
+setup_fft();
+
+@slider
+
+(fftsize_idx != fftsize_idx_prev) || (ovr_idx != ovr_idx_prev) ? (
+  setup_fft();
+  fftsize_idx_prev = fftsize_idx;
+  ovr_idx_prev = ovr_idx;
+);
+
+mode != mode_prev ? ( mode_prev = mode; xfade_env = 0; );
+
+dual = chainB_src > 0.5;
+smooth_coef = 1 - exp(-1/(0.005*srate));
+xfade_coef  = 1 - exp(-1/(0.015*srate));
+
+@sample
+
+outL = outbufA[pos]*ola_norm;  outbufA[pos] = 0;
+outR = outbufB[pos]*ola_norm;  outbufB[pos] = 0;
+
+inbufA[pos] = spl0;
+inbufB[pos] = dual ? spl1 : spl0;
+
+pos += 1;
+pos >= fftsize ? pos = 0;
+
+hopcount += 1;
+hopcount >= hopsize ? ( hopcount = 0; do_frame(); );
+
+wet_smooth  += (mix - wet_smooth)*smooth_coef;
+gain_smooth += (outgain - gain_smooth)*smooth_coef;
+xfade_env   += (1 - xfade_env)*xfade_coef;
+xfade_env > 1 ? xfade_env = 1;
+
+wetL = outL*xfade_env;
+wetR = outR*xfade_env;
+
+mixL = spl0*(1-wet_smooth) + wetL*wet_smooth;
+mixR = spl1*(1-wet_smooth) + wetR*wet_smooth;
+
+spl0 = softclip(mixL*gain_smooth);
+spl1 = softclip(mixR*gain_smooth);
+
+@gfx 640 440
+
+lbtn = mouse_cap&1;
+click = lbtn && !lbtn_prev;
+
+gfx_set(0.07,0.07,0.09,1);
+gfx_rect(0,0,gfx_w,gfx_h,1);
+
+gfx_set(0.85,0.85,0.9,1);
+gfx_setfont(1,"Arial",18);
+gfx_x=14; gfx_y=10;
+gfx_drawstr("FFT SUITE  -  Phase Vocoder Bin Processor");
+
+gfx_setfont(2,"Arial",12);
+gfx_set(0.55,0.55,0.6,1);
+gfx_x=14; gfx_y=32;
+gfx_drawstr("SuperCollider PV_ UGens, reimagined for JSFX / EEL2");
+
+mode==0  ? #mn="00 PV_Copy (bypass)" :
+mode==1  ? #mn="01 PV_MagFreeze" :
+mode==2  ? #mn="02 PV_MagAbove" :
+mode==3  ? #mn="03 PV_MagBelow" :
+mode==4  ? #mn="04 PV_MagClip" :
+mode==5  ? #mn="05 PV_MagSquared" :
+mode==6  ? #mn="06 PV_MagSmear" :
+mode==7  ? #mn="07 PV_MagNoise" :
+mode==8  ? #mn="08 PV_MagShift" :
+mode==9  ? #mn="09 PV_BinShift" :
+mode==10 ? #mn="10 PV_PhaseShift" :
+mode==11 ? #mn="11 PV_PhaseShift90 / 270" :
+mode==12 ? #mn="12 PV_Conj" :
+mode==13 ? #mn="13 PV_BrickWall" :
+mode==14 ? #mn="14 PV_LocalMax" :
+mode==15 ? #mn="15 PV_RandComb" :
+mode==16 ? #mn="16 PV_RectComb / RectComb2" :
+mode==17 ? #mn="17 PV_Diffuser" :
+mode==18 ? #mn="18 PV_ConformalMap" :
+mode==19 ? #mn="19 PV_Onset (HainsworthFoote / JensenAndersen)" :
+mode==20 ? #mn="20 PV_Add  [dual chain]" :
+mode==21 ? #mn="21 PV_Mul  [dual chain]" :
+mode==22 ? #mn="22 PV_MagMul  [dual chain]" :
+mode==23 ? #mn="23 PV_Max  [dual chain]" :
+mode==24 ? #mn="24 PV_Min  [dual chain]" :
+mode==25 ? #mn="25 PV_CopyPhase  [dual chain]" :
+mode==26 ? #mn="26 PV_BinWipe  [dual chain]" :
+           #mn="27 PV_RandWipe  [dual chain]";
+
+my = 58;
+gfx_set(0.2,0.2,0.26,1); gfx_rect(14,my,28,24,1);
+gfx_set(0.9,0.9,0.95,1); gfx_setfont(1,"Arial",15); gfx_x=24; gfx_y=my+4; gfx_drawstr("<");
+click && mouse_x>=14 && mouse_x<42 && mouse_y>=my && mouse_y<my+24 ? (
+  mode -= 1; mode<0 ? mode=27; sliderchange(mode);
+);
+
+gfx_set(0.9,0.85,0.6,1); gfx_setfont(1,"Arial",15);
+gfx_x=50; gfx_y=my+4;
+gfx_drawstr(#mn);
+
+gfx_set(0.2,0.2,0.26,1); gfx_rect(600,my,26,24,1);
+gfx_set(0.9,0.9,0.95,1); gfx_x=609; gfx_y=my+4; gfx_drawstr(">");
+click && mouse_x>=600 && mouse_x<626 && mouse_y>=my && mouse_y<my+24 ? (
+  mode += 1; mode>27 ? mode=0; sliderchange(mode);
+);
+
+px=14; py=98; pw=280; ph=200;
+gfx_set(0.12,0.12,0.15,1); gfx_rect(px,py,pw,ph,1);
+gfx_set(0.3,0.3,0.36,1); gfx_rect(px,py,pw,ph,0);
+gfx_set(0.4,0.4,0.46,1);
+gfx_line(px+pw*0.5,py,px+pw*0.5,py+ph);
+gfx_line(px,py+ph*0.5,px+pw,py+ph*0.5);
+
+lbtn && mouse_x>=px && mouse_x<=px+pw && mouse_y>=py && mouse_y<=py+ph ? (
+  paramA = (mouse_x-px)/pw;
+  paramB = 1-(mouse_y-py)/ph;
+  paramA<0?paramA=0; paramA>1?paramA=1;
+  paramB<0?paramB=0; paramB>1?paramB=1;
+  sliderchange(paramA); sliderchange(paramB);
+);
+
+cx = px + paramA*pw; cy = py + (1-paramB)*ph;
+gfx_set(0.95,0.55,0.2,1);
+gfx_circle(cx,cy,6,1,1);
+
+gfx_set(0.6,0.6,0.65,1); gfx_setfont(2,"Arial",11);
+gfx_x=px; gfx_y=py+ph+4; gfx_drawstr("Param A / Param B  (click + drag)");
+
+fbx=310; fby=98; fbw=140; fbh=28;
+freeze>0.5 ? gfx_set(0.9,0.3,0.25,1) : gfx_set(0.22,0.22,0.28,1);
+gfx_rect(fbx,fby,fbw,fbh,1);
+gfx_set(0.95,0.95,0.95,1); gfx_setfont(1,"Arial",13); gfx_x=fbx+38; gfx_y=fby+7; gfx_drawstr("FREEZE");
+click && mouse_x>=fbx && mouse_x<=fbx+fbw && mouse_y>=fby && mouse_y<=fby+fbh ? (
+  freeze = freeze>0.5?0:1; sliderchange(freeze);
+);
+
+dbx=310; dby=134; dbw=140; dbh=28;
+dual ? gfx_set(0.25,0.55,0.9,1) : gfx_set(0.22,0.22,0.28,1);
+gfx_rect(dbx,dby,dbw,dbh,1);
+gfx_set(0.95,0.95,0.95,1); gfx_x=dbx+16; gfx_y=dby+7; gfx_drawstr("R = CHAIN B");
+click && mouse_x>=dbx && mouse_x<=dbx+dbw && mouse_y>=dby && mouse_y<=dby+dbh ? (
+  chainB_src = chainB_src>0.5?0:1; sliderchange(chainB_src);
+);
+
+gfx_set(0.65,0.65,0.7,1); gfx_setfont(2,"Arial",12);
+sprintf(#info, "FFT %d pts   hop %d smp   %dx overlap", fftsize, hopsize, overlap_factor);
+gfx_x=310; gfx_y=176; gfx_drawstr(#info);
+
+sprintf(#info2, "mix %d pct   gain %.2fx", mix*100, outgain);
+gfx_x=310; gfx_y=196; gfx_drawstr(#info2);
+
+mode==19 ? (
+  onsetFlash *= 0.9;
+  onsetFlash > 0.05 ? (
+    gfx_set(1,0.3,0.2,onsetFlash);
+    gfx_rect(310,220,140,28,1);
+    gfx_set(1,1,1,1); gfx_setfont(1,"Arial",13); gfx_x=345; gfx_y=227; gfx_drawstr("ONSET");
+  );
+);
+
+sx=14; sy=316; sw=612; sh=104;
+gfx_set(0.12,0.12,0.15,1); gfx_rect(sx,sy,sw,sh,1);
+gfx_set(0.3,0.8,0.5,1);
+nb = halfN>512 ? 512 : halfN;
+i=0;
+while(i<nb)(
+  bi = floor(i * halfN / nb);
+  v = dispmagA[bi] / (fftsize*0.5);
+  v = v>1?1:v;
+  bh2 = v*sh;
+  gfx_line(sx + i*sw/nb, sy+sh, sx + i*sw/nb, sy+sh-bh2);
+  i += 1;
+);
+gfx_set(0.5,0.5,0.55,1); gfx_setfont(2,"Arial",11);
+gfx_x=sx; gfx_y=sy-14; gfx_drawstr("Spectrum - chain A");
+
+lbtn_prev = lbtn;

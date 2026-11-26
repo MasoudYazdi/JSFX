@@ -1,0 +1,228 @@
+desc:Ecosystemics — Feedback Ecology Composition Engine
+// An ecosystemic composition system in the Di Scipio / Ashby-homeostat sense:
+// a population of independent delay-agents listens to the total system energy
+// (room input blended with the system's own recent output) and each agent
+// adjusts its own gain via negative feedback toward a shared homeostatic
+// setpoint. Timbre, rhythm and density are emergent, not pre-composed —
+// the "score" is the dynamical behavior of the loop itself.
+//
+// Routing:
+//  - Feed a live room mic into the plugin input for true room-scale
+//    ecosystemics (mic -> algorithm -> speaker -> room -> mic).
+//  - Or set "Self-Feedback Depth" to 1.0 and run with silence/no mic for a
+//    fully self-contained algorithmic ecosystem (closed-loop homeostat).
+//
+//tags: generative feedback ecosystemic algorithmic homeostat
+//author: mass / claude
+
+slider1:0.15<0.001,0.9,0.001>Homeostatic Setpoint (target energy)
+slider2:0.0020<0.0001,0.0500,0.0001>Adaptation Rate (agent learning speed)
+slider3:4<1,4,1{1,2,3,4}>Active Agents
+slider4:0.5<0,1,0.01>Self-Feedback Depth (system listens to itself)
+slider5:180<10,2000,1>Base Delay Spread (ms)
+slider6:0.6<0,1,0.01>Saturation / Self-Limiting Amount
+slider7:0.7<0,1,0.01>Niche Differentiation (spectral divergence)
+slider8:0.8<0,2,0.01>Output Gain
+slider9:0.15<0.001,2.0,0.001>Energy Integration Time (slow, sec)
+slider10:0.01<0,0.05,0.0001>Background Noise Floor (seeds the ecosystem)
+
+in_pin:room / mic in L
+in_pin:room / mic in R
+out_pin:ecosystem out L
+out_pin:ecosystem out R
+
+@init
+
+function softclip(x) local(ax)
+(
+  ax = abs(x);
+  x / (1 + ax);
+);
+
+MAX_AGENTS = 4;
+MAX_DELAY_SEC = 4;
+delay_len_max = srate * MAX_DELAY_SEC;
+
+free_ptr = 0;
+
+bufptr = free_ptr; free_ptr += MAX_AGENTS;
+i = 0;
+while (i < MAX_AGENTS) (
+  bufptr[i] = free_ptr;
+  free_ptr += delay_len_max;
+  i += 1;
+);
+
+gain     = free_ptr; free_ptr += MAX_AGENTS;
+pos      = free_ptr; free_ptr += MAX_AGENTS;
+delaylen = free_ptr; free_ptr += MAX_AGENTS;
+lpstate  = free_ptr; free_ptr += MAX_AGENTS;
+lpcoef   = free_ptr; free_ptr += MAX_AGENTS;
+phase    = free_ptr; free_ptr += MAX_AGENTS;
+sens     = free_ptr; free_ptr += MAX_AGENTS;
+lforate  = free_ptr; free_ptr += MAX_AGENTS;
+
+gain[0]=0.25; gain[1]=0.25; gain[2]=0.25; gain[3]=0.25;
+pos[0]=0; pos[1]=0; pos[2]=0; pos[3]=0;
+lpstate[0]=0; lpstate[1]=0; lpstate[2]=0; lpstate[3]=0;
+
+// distinct starting phases + sensitivities so agents diverge instead of
+// moving in lockstep -- this is what makes them behave like separate niches
+// rather than one agent copied four times
+phase[0]=0.31; phase[1]=1.77; phase[2]=2.94; phase[3]=4.12;
+sens[0]=1.00;  sens[1]=0.72;  sens[2]=1.35;  sens[3]=0.55;
+lforate[0]=0.037; lforate[1]=0.061; lforate[2]=0.023; lforate[3]=0.089;
+
+fast_env = 0;
+slow_env = 0;
+output_hist = 0;
+error = 0;
+slow_rms = 0;
+fast_rms = 0;
+
+pi2 = 6.28318530718;
+
+@slider
+
+n_agents   = slider3;
+setpoint   = slider1;
+adapt_rate = slider2;
+selfdepth  = slider4;
+base_ms    = slider5;
+sat_amt    = slider6;
+niche_amt  = slider7;
+outgain    = slider8;
+slow_tau   = slider9;
+noise_amt  = slider10;
+
+slow_coef = exp(-1/(max(slow_tau,0.001)*srate));
+fast_coef = exp(-1/(0.008*srate));
+
+delaylen[0] = (base_ms*0.001)*srate*0.68;
+delaylen[1] = (base_ms*0.001)*srate*1.00;
+delaylen[2] = (base_ms*0.001)*srate*1.37;
+delaylen[3] = (base_ms*0.001)*srate*1.93;
+
+i = 0;
+while (i < 4) (
+  delaylen[i] = min(delaylen[i], delay_len_max-64);
+  lpcoef[i] = min(0.02 + (0.20 + 0.22*i)*niche_amt, 0.99);
+  i += 1;
+);
+
+@sample
+
+// a real room mic is never truly silent -- without an equivalent noise
+// floor here, a zero-input / zero-state closed loop has nothing to
+// amplify and will sit at exact digital silence forever. this seeds it.
+noise = (rand(2) - 1) * noise_amt;
+room_in = (spl0 + spl1) * 0.5 + noise;
+
+// closed-loop listening: system hears the room blended with its own
+// recent output -- the core ecosystemic move (Ashby's homeostat applied
+// to audio: the actuator's effect becomes part of what the sensor reads)
+listen = room_in*(1-selfdepth) + output_hist*selfdepth;
+
+a2 = listen*listen;
+fast_env = fast_env*fast_coef + a2*(1-fast_coef);
+slow_env = slow_env*slow_coef + a2*(1-slow_coef);
+
+fast_rms = sqrt(fast_env);
+slow_rms = sqrt(slow_env);
+
+// homeostatic error: this is the single feedback signal every agent reacts
+// to, each through its own sensitivity -- negative feedback keeps the
+// ecosystem near setpoint without any agent knowing about the others
+error = setpoint - slow_rms;
+
+mix = 0;
+i = 0;
+while (i < n_agents) (
+  buf = bufptr[i];
+
+  // slow per-agent delay-time drift -- keeps the texture breathing instead
+  // of locking into a static comb-filter pattern
+  mod = sin(phase[i]) * 0.15 * delaylen[i];
+  phase[i] += pi2*lforate[i]/srate;
+  phase[i] > pi2 ? phase[i] -= pi2;
+
+  d = delaylen[i] + mod;
+  d = max(d,4); d = min(d, delay_len_max-4);
+
+  rp = pos[i] - d;
+  rp < 0 ? rp += delay_len_max;
+  rp_i = floor(rp);
+  frac = rp - rp_i;
+  rp_i2 = rp_i+1; rp_i2 >= delay_len_max ? rp_i2 -= delay_len_max;
+
+  s0 = buf[rp_i];
+  s1 = buf[rp_i2];
+  tapped = s0 + (s1-s0)*frac;
+
+  // niche filter: gives each agent a distinct spectral identity so the
+  // population doesn't converge to one timbre
+  lpstate[i] = lpstate[i] + lpcoef[i]*(tapped - lpstate[i]);
+  agent_sig = lpstate[i];
+
+  // homeostatic adaptation -- the actual "composing" happens here
+  gain[i] = gain[i] + adapt_rate*sens[i]*error;
+  gain[i] = max(min(gain[i], 1.3), -1.3);
+
+  wet = agent_sig * gain[i];
+
+  drive = 1 + 4*sat_amt;
+  wet = softclip(wet*drive) / softclip(drive);
+
+  buf[pos[i]] = listen*0.5 + wet*0.5;
+
+  pos[i] += 1;
+  pos[i] >= delay_len_max ? pos[i] -= delay_len_max;
+
+  mix += wet;
+  i += 1;
+);
+
+mix = mix / max(n_agents,1);
+outv = mix*outgain;
+outv = softclip(outv*1.1);
+
+output_hist = outv;
+
+spl0 = outv;
+spl1 = outv;
+
+@gfx 420 220
+
+gfx_clear = -1;
+gfx_r=gfx_g=gfx_b=1;
+gfx_x=10; gfx_y=8;
+gfx_drawstr(sprintf(#s, "slow energy %.4f   setpoint %.4f   error %+.4f", slow_rms, setpoint, error));
+
+w = gfx_w; h = gfx_h;
+mid = h*0.55;
+barw = 40;
+
+i = 0;
+while (i < n_agents) (
+  bx = 30 + i*(barw+30);
+  bh = max(min(gain[i]*70, 90), -90);
+  gfx_r = 0.25+0.15*i; gfx_g = 0.55; gfx_b = 0.85-0.12*i;
+  bh > 0 ? gfx_rect(bx, mid-bh, barw, bh) : gfx_rect(bx, mid, barw, -bh);
+  gfx_r=gfx_g=gfx_b=0.7;
+  gfx_x = bx; gfx_y = mid+95;
+  gfx_drawstr(sprintf(#l, "agent %d", i+1));
+  i += 1;
+);
+
+gfx_r=1; gfx_g=1; gfx_b=1;
+gfx_x=20; gfx_y=mid;
+gfx_lineto(w-20, mid, 0);
+
+gfx_r=1; gfx_g=0.85; gfx_b=0.2;
+mh = min(slow_rms*500, h-mid-10);
+gfx_rect(w-40, h-10-mh, 18, mh);
+
+gfx_r=1; gfx_g=0.2; gfx_b=0.2;
+sph = min(setpoint*500, h-mid-10);
+gfx_x=w-45; gfx_y=h-10-sph;
+gfx_lineto(w-12, h-10-sph, 0);

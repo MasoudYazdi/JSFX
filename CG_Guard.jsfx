@@ -1,0 +1,104 @@
+desc:CG Guard - crash-proof safety limiter (put FIRST and LAST on the chain)
+tags:safety limiter utility live
+options:no_meter
+slider1:-1<-12,0,0.1>Ceiling (dB)
+slider2:80<10,500,1>Release (ms)
+slider3:0<-24,12,0.1>Trim (dB)
+slider4:1<0,1,1{Off,On}>DC Block
+slider5:1<0,1,1{Off,On}>Runaway Mute
+slider6:0<0,1,1{-,RESET}>Reset mute / counters
+
+in_pin:Input L
+in_pin:Input R
+out_pin:Output L
+out_pin:Output R
+
+@init
+
+ext_noinit=1;
+PI=3.141592653589793; TWOPI=6.283185307179586; CEIL=2;
+
+// ---- NaN-safe primitives. Comparisons with NaN are false, so every function below maps NaN/inf to a finite value ----
+function lim(x,lo,hi) ( x>=lo ? (x<=hi ? x : hi) : lo );
+function fin(x) ( abs(x)<100000 ? x : 0 );
+function db2lin(d) ( exp(lim(d,-120,60)*0.11512925464970229) );
+function dbgain(d) ( d<=-59.9 ? 0 : db2lin(d) );
+function lin2db(x) ( 8.685889638065035*log(abs(x)+0.000000001) );
+function sat(x) ( abs(x)<3 ? x*(27+x*x)/(27+9*x*x) : (x>0 ? 1 : -1) );
+function sclip(x,c) local(ax,k,y) ( ax=abs(x); k=c*0.7; y=ax<k ? ax : k+(c-k)*sat((ax-k)/(c-k)); x<0 ? -y : y );
+function mixf(a,b,t) ( a+(b-a)*t );
+function lpc(fc) ( 1-exp(-TWOPI*lim(fc,1,srate*0.45)/srate) );
+function smooth01(t) ( t<=0 ? 0 : (t>=1 ? 1 : t*t*(3-2*t)) );
+function rnd() ( rng=rng*1664525+1013904223; rng-=floor(rng/4294967296)*4294967296; rng/4294967296 );
+function rnds() ( rnd()*2-1 );
+function alloc(n) local(p) ( p=mp; mp+=n; p );
+
+mp=0;
+LB=2048;
+dlL=alloc(LB); dlR=alloc(LB); nd=alloc(LB);
+LA=min(max(8,floor(0.0015*srate)),LB-8);
+memset(0,0,mp);
+dcr=1-TWOPI*8/srate;
+k_att=1-exp(-1/(0.00025*srate));
+k_pk=exp(-1/(0.05*srate));
+k_mdn=1-exp(-1/(0.010*srate)); k_mup=1-exp(-1/(0.100*srate));
+wp=0; gmin=1; ghold=0; g=1; mg=1; mute=0; rw_t=0; ok_t=0; pk_env=0;
+bad_cnt=0; clamp_cnt=0; pk_in_m=0; pk_out_m=0; rst_prev=0;
+pdc_delay=LA; pdc_bot_ch=0; pdc_top_ch=2;
+function bar(x,y,w,v) ( gfx_set(0.15,0.15,0.2,1); gfx_rect(x,y,w,8); gfx_set(0.95,0.55,0.2,1); gfx_rect(x,y,w*lim(v,0,1),8); );
+function lab(x,y,s) ( gfx_set(0.8,0.8,0.85,1); gfx_x=x; gfx_y=y; gfx_drawstr(s); );
+
+@block
+c_lin=db2lin(lim(slider1,-12,0));
+k_rel=1-exp(-1/(lim(slider2,10,500)*0.001*srate));
+trim=db2lin(lim(slider3,-24,12));
+dc_on=slider4>0.5; rw_on=slider5>0.5;
+(slider6>0.5 && rst_prev<0.5) ? ( mute=0; rw_t=0; ok_t=0; bad_cnt=0; clamp_cnt=0; );
+rst_prev=slider6;
+
+@sample
+x0=spl0; x1=spl1;
+(abs(x0)<100000 && abs(x1)<100000) ? 0 : ( bad_cnt+=1; );
+x0=fin(x0)*trim; x1=fin(x1)*trim;
+dc_on ? (
+  yy=x0-dxL+dcr*dyL; dxL=x0; dyL=yy; x0=yy;
+  yy=x1-dxR+dcr*dyR; dxR=x1; dyR=yy; x1=yy;
+);
+pk=max(abs(x0),abs(x1));
+pk_env=max(pk,pk_env*k_pk);
+// ring writes: delayed audio + gain-need history
+dlL[wp]=x0; dlR[wp]=x1;
+need=pk>c_lin ? c_lin/pk : 1;
+nd[wp]=need;
+need<=gmin ? ( gmin=need; ghold=LA; ) : (
+  ghold-=1;
+  ghold<=0 ? (
+    gmin=1; i=0;
+    while(i<=LA) ( j=wp-i; j<0 ? (j+=LB); nd[j]<gmin ? (gmin=nd[j]); i+=1; );
+    ghold=LA;
+  );
+);
+g+=(gmin-g)*(gmin<g ? k_att : k_rel);
+rp=wp-LA; rp<0 ? (rp+=LB);
+y0=dlL[rp]*g; y1=dlR[rp]*g;
+wp+=1; wp>=LB ? (wp=0);
+// runaway detector: >20 dB of sustained gain reduction means something upstream is exploding
+g<0.1 ? ( rw_t+=1; ok_t=0; ) : ( rw_t>0 ? (rw_t-=1); );
+(rw_on && mute<0.5 && rw_t>0.25*srate) ? ( mute=1; ok_t=0; );
+mute>0.5 ? ( pk_env<c_lin*3 ? (ok_t+=1) : (ok_t=0); ok_t>0.6*srate ? ( mute=0; rw_t=0; ); );
+mg+=((mute>0.5 ? 0 : 1)-mg)*(mute>0.5 ? k_mdn : k_mup);
+y0*=mg; y1*=mg;
+// absolute guarantee: nothing above the ceiling ever leaves this plugin
+(abs(y0)>c_lin || abs(y1)>c_lin) ? ( clamp_cnt+=1; );
+y0=lim(y0,-c_lin,c_lin); y1=lim(y1,-c_lin,c_lin);
+spl0=y0; spl1=y1;
+pk_in_m=max(pk,pk_in_m*0.99995); pk_out_m=max(max(abs(y0),abs(y1)),pk_out_m*0.99995);
+
+@gfx 420 160
+gfx_set(0.04,0.04,0.06,1); gfx_rect(0,0,gfx_w,gfx_h);
+lab(10,6,mute>0.5 ? "CG GUARD  --  RUNAWAY MUTE ACTIVE (press RESET)" : "CG GUARD");
+lab(10,32,"IN");  bar(70,34,300,pk_in_m*0.5);
+lab(10,50,"OUT"); bar(70,52,300,pk_out_m);
+lab(10,68,"GAIN RED."); bar(70,70,300,1-g);
+lab(10,92,"NaN/inf scrubbed:"); gfx_x=140; gfx_y=92; gfx_drawnumber(bad_cnt,0);
+lab(10,108,"Hard clamps:"); gfx_x=140; gfx_y=108; gfx_drawnumber(clamp_cnt,0);

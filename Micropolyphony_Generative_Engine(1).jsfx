@@ -1,0 +1,278 @@
+desc:Micropolyphony Generative Engine (Multi-Timbre, Stereo Spread)
+//------------------------------------------------------------------------
+// A self-generating micropolyphonic texture engine, in the lineage of
+// Ligeti's canon-based cluster writing and Xenakis's sieve-based pitch
+// selection. Voices spawn stochastically, each choosing its own timbre
+// (sine / soft-triangle / inharmonic FM bell / filtered noise), fade
+// in and out with cosine envelopes, drift in pitch (smooth glissando),
+// and are placed and gently animated across the stereo field.
+//
+// LIVE parameters (update instantly, affect all voices right now):
+//   Center Frequency, Cluster Width, Drift Depth/Rate, Stereo Spread,
+//   Pan Motion, Number of Voices, Master Gain.
+//
+// GENERATIVE parameters (only apply to voices spawned AFTER the change):
+//   Timbre Variety, Pitch Mode / Sieve settings, Lifetime, Attack/Release.
+//   Use Force Refresh to fade out + respawn everything so these apply
+//   audibly right away instead of over the next voice-lifetime cycle.
+//
+// Pitch selection:
+//   OFF  - continuous microtonal cloud (real-valued semitone offsets)
+//   ON   - Xenakis-style sieve: union of two residue classes
+//          (offset % modA == resA) OR (offset % modB == resB)
+//
+// No audio input required - pure generator. Drop on any track and run.
+//------------------------------------------------------------------------
+
+slider1:num_voices=12<2,32,1>Number of Voices [live]
+slider2:center_freq=220<55,1760,1>Center Frequency (Hz) [live]
+slider3:cluster_width=7<0,24,0.1>Cluster Width (semitones) [live]
+slider4:spawn_rate=2<0.05,10,0.01>Spawn Rate (voices/sec) [live]
+slider5:life_min=3<0.5,30,0.1>Voice Lifetime Min (sec) [new voices]
+slider6:life_max=8<0.5,40,0.1>Voice Lifetime Max (sec) [new voices]
+slider7:drift_depth=2<0,12,0.1>Drift Depth (semitones) [live]
+slider8:drift_rate=5<0.2,30,0.1>Drift Rate (sec/glide) [live]
+slider9:atk_time=1.5<0.02,10,0.01>Attack Time (sec) [new voices]
+slider10:rel_time=2<0.02,10,0.01>Release Time (sec) [new voices]
+slider11:stereo_spread=80<0,100,1>Stereo Spread (%) [live]
+slider12:pan_motion=20<0,100,1>Pan Motion Depth (%) [live]
+slider13:timbre_variety=3<0,3,1{Sine Only,Sine + Triangle,+ FM Bell,+ Filtered Noise (All)}>Timbre Variety [new voices]
+slider14:sieve_enable=0<0,1,1{Off (microtonal cloud),On (Xenakis sieve)}>Pitch Mode [new voices]
+slider15:modA=3<2,12,1>Sieve Modulus A [new voices]
+slider16:resA=0<0,11,1>Sieve Residue A [new voices]
+slider17:modB=4<2,12,1>Sieve Modulus B [new voices]
+slider18:resB=0<0,11,1>Sieve Residue B [new voices]
+slider19:master_gain_db=-6<-36,12,0.1>Master Gain (dB) [live]
+slider20:force_refresh=0<0,1,1{Off,Toggle to flush + respawn all voices}>Force Refresh
+
+@init
+
+MAX_V = 32;
+V_STRIDE = 22;
+// voice slot layout:
+//  0 active         1 pitch_frac      2 micro_detune    3 drift_start
+//  4 drift_target    5 drift_elapsed   6 drift_period    7 phase
+//  8 fm_phase        9 pan_frac       10 pan_lfo_phase  11 pan_lfo_rate
+// 12 timbre         13 age_samples   14 lifetime        15 attack_samps
+// 16 release_samps  17 amp_target    18 fm_ratio        19 fm_index
+// 20 filt_low       21 filt_band
+
+voice_mem = 0;
+freemem = voice_mem + MAX_V*V_STRIDE;
+
+spawn_timer = 0;
+dc_x1L = dc_y1L = dc_x1R = dc_y1R = 0;
+
+v = 0;
+while (v < MAX_V) (
+  b = voice_mem + v*V_STRIDE;
+  b[0] = 0;
+  v += 1;
+);
+
+function rndrange(lo,hi) ( lo + rand(hi-lo) );
+
+function flush_voice(b) ( b[13] = max(b[13], b[14]-b[16]); );
+
+function spawn_voice() local(v,b,found,width,offset,cand,pc,pc2,tries,found2,frac,timbre_choice,life_sec)
+(
+  found = -1; v = 0;
+  while (v < num_voices && found < 0) (
+    b = voice_mem + v*V_STRIDE;
+    b[0] == 0 ? found = v;
+    v += 1;
+  );
+  found >= 0 ? (
+    b = voice_mem + found*V_STRIDE;
+    width = max(cluster_width, 0.0001);
+
+    sieve_enable > 0.5 ? (
+      offset = 0; found2 = 0; tries = 0;
+      while (tries < 20 && found2 == 0) (
+        cand = floor(rndrange(-cluster_width, cluster_width+1));
+        pc  = ((cand % modA) + modA) % modA;
+        pc2 = ((cand % modB) + modB) % modB;
+        (pc == resA || pc2 == resB) ? ( offset = cand; found2 = 1; );
+        tries += 1;
+      );
+      found2 == 0 ? offset = rndrange(-cluster_width, cluster_width);
+    ) : (
+      offset = rndrange(-cluster_width, cluster_width);
+    );
+
+    // store pitch as a FRACTION of cluster width, not an absolute value,
+    // so moving Cluster Width / Center Frequency later rescales/transposes
+    // this voice live instead of requiring a respawn.
+    frac = offset / width;
+    frac = max(min(frac,1),-1);
+    b[1] = frac;
+    b[2] = rndrange(-0.1, 0.1); // fixed micro-detune (chorus)
+
+    b[3] = 0;                              // drift_start (semitones)
+    b[4] = rndrange(-1,1) * drift_depth;   // drift_target
+    b[5] = 0;                              // drift_elapsed
+    b[6] = max(srate*drift_rate*(0.5+rand(1)), 1); // drift_period
+
+    b[7] = rand(1); // phase
+    b[8] = 0;       // fm phase
+
+    b[9]  = rndrange(-1,1); // pan_frac (fixed direction; scaled live by Stereo Spread)
+    b[10] = rand(1);        // pan_lfo_phase
+    b[11] = rndrange(0.02, 0.08); // pan_lfo_rate
+
+    timbre_choice = floor(rand(timbre_variety+1));
+    b[12] = timbre_choice;
+
+    life_sec = rndrange(life_min, life_max);
+    b[13] = 0;
+    b[14] = life_sec*srate;
+    b[15] = max(atk_time*srate*rndrange(0.7,1.3), 1);
+    b[16] = max(rel_time*srate*rndrange(0.7,1.3), 1);
+
+    b[17] = rndrange(0.5, 1.0); // amp target level
+    b[18] = rndrange(1.4, 3.1); // fm ratio
+    b[19] = rndrange(0.5, 3.0); // fm index
+
+    b[20] = 0; // filt low
+    b[21] = 0; // filt band
+
+    b[0] = 1;
+  );
+);
+
+function process_voice(b) local(age,lt,atk,rel,target,envamp,t,ts,drift_semis,f,pan,angle,osc,noise,f_coef,notch,high)
+(
+  age = b[13]; lt = b[14]; atk = b[15]; rel = b[16]; target = b[17];
+
+  age < atk ? (
+    envamp = 0.5*(1-cos($pi*age/atk)) * target;
+  ) : (
+    age > (lt-rel) ? (
+      envamp = 0.5*(1+cos($pi*(age-(lt-rel))/rel)) * target;
+      envamp < 0 ? envamp = 0;
+    ) : (
+      envamp = target;
+    );
+  );
+
+  // smooth glissando: interpolate across the FULL drift period using an
+  // eased curve, rather than snapping fast and holding.
+  b[5] += 1;
+  t = min(b[5]/b[6], 1);
+  ts = t*t*(3-2*t);
+  drift_semis = b[3] + (b[4]-b[3])*ts;
+  b[5] >= b[6] ? (
+    b[3] = b[4];
+    b[4] = rndrange(-1,1) * drift_depth;
+    b[6] = max(srate*drift_rate*(0.5+rand(1)), 1);
+    b[5] = 0;
+  );
+
+  // fully live pitch: recombines center freq + cluster width + detune +
+  // drift every sample, so Center Frequency / Cluster Width / Drift
+  // sliders all update this voice's pitch immediately.
+  f = center_freq * pow(2, (b[1]*cluster_width + b[2] + drift_semis)/12);
+
+  b[12] == 0 ? (
+    osc = sin(2*$pi*b[7]);
+  ) : b[12] == 1 ? (
+    osc = 0.9*( sin(2*$pi*b[7]) + sin(2*$pi*b[7]*3)/9 + sin(2*$pi*b[7]*5)/25 );
+  ) : b[12] == 2 ? (
+    b[8] += (f*b[18])/srate; b[8] -= floor(b[8]);
+    osc = sin(2*$pi*b[7] + b[19]*sin(2*$pi*b[8]));
+  ) : (
+    noise = rand(2)-1;
+    f_coef = 2*sin($pi*min(f,srate*0.45)/srate);
+    notch = noise - 0.2*b[21];
+    b[20] = b[20] + f_coef*b[21];
+    high = notch - b[20];
+    b[21] = f_coef*high + b[21];
+    osc = b[21]*3;
+  );
+
+  b[7] += f/srate; b[7] -= floor(b[7]);
+
+  // pan is also live: base direction (fixed) scaled by current Stereo
+  // Spread, plus a per-voice slow LFO scaled by current Pan Motion.
+  b[10] += b[11]/srate; b[10] -= floor(b[10]);
+  pan = b[9]*(stereo_spread*0.01) + sin(2*$pi*b[10])*(pan_motion*0.01)*0.5;
+  pan = max(min(pan,1),-1);
+  angle = (pan+1)*0.25*$pi;
+
+  voiceL = osc*envamp*cos(angle);
+  voiceR = osc*envamp*sin(angle);
+
+  b[13] = age+1;
+  b[13] >= lt ? b[0] = 0;
+);
+
+@slider
+
+num_voices    = min(slider1|0, MAX_V);
+center_freq   = slider2;
+cluster_width = slider3;
+drift_depth   = slider7;
+drift_rate    = slider8;
+atk_time      = slider9;
+rel_time      = slider10;
+stereo_spread = slider11;
+pan_motion    = slider12;
+timbre_variety = slider13|0;
+sieve_enable  = slider14;
+modA = max(slider15|0, 2);
+resA = (slider16|0) % modA;
+modB = max(slider17|0, 2);
+resB = (slider18|0) % modB;
+master_gain   = pow(10, slider19/20);
+life_min = slider5;
+life_max = max(slider6, life_min);
+
+// gracefully retire voices beyond the new (lower) voice-count cap
+v2 = num_voices;
+while (v2 < MAX_V) (
+  b2 = voice_mem + v2*V_STRIDE;
+  b2[0] == 1 ? flush_voice(b2);
+  v2 += 1;
+);
+
+// Force Refresh: fades out all active voices so fresh ones spawn
+// immediately with current generative settings (timbre, sieve,
+// lifetime, attack/release) instead of waiting out old lifetimes.
+force_refresh > 0.5 ? (
+  v3 = 0;
+  while (v3 < MAX_V) (
+    b3 = voice_mem + v3*V_STRIDE;
+    b3[0] == 1 ? flush_voice(b3);
+    v3 += 1;
+  );
+);
+
+@sample
+
+spawn_timer -= 1;
+spawn_timer <= 0 ? (
+  spawn_timer = (srate / max(spawn_rate,0.01)) * (0.5 + rand(1));
+  spawn_voice();
+);
+
+outL = 0; outR = 0;
+v = 0;
+while (v < num_voices) (
+  b = voice_mem + v*V_STRIDE;
+  b[0] == 1 ? (
+    process_voice(b);
+    outL += voiceL;
+    outR += voiceR;
+  );
+  v += 1;
+);
+
+norm = 1/sqrt(max(num_voices,4));
+outL *= norm; outR *= norm;
+
+// DC blocker (one-pole)
+tmpL = outL - dc_x1L + 0.995*dc_y1L; dc_x1L = outL; dc_y1L = tmpL;
+tmpR = outR - dc_x1R + 0.995*dc_y1R; dc_x1R = outR; dc_y1R = tmpR;
+
+spl0 = tmpL * master_gain;
+spl1 = tmpR * master_gain;

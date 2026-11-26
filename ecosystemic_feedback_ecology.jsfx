@@ -1,0 +1,250 @@
+desc:Ecosystemic Feedback Ecology Engine
+
+// ============================================================================
+// ECOSYSTEMIC FEEDBACK ECOLOGY ENGINE
+// ----------------------------------------------------------------------------
+// A composition system in the "Audible Ecosystemics" lineage (Di Scipio).
+// The unit of composition is not a sound but a FEEDBACK ECOLOGY: room mic ->
+// N delay/filter "agents" -> speaker -> room -> mic. The algorithm does not
+// generate sound directly; it modulates the *conditions* under which the
+// room-machine feedback loop can sustain itself.
+//
+// Three coupled control processes, operating at different timescales:
+//
+//   1. HOMEOSTASIS (slow, global)
+//      A single scalar gain is driven by an error signal between measured
+//      output RMS and a target energy level. This is literally a homeostat:
+//      the system is always working to keep its own output within bounds,
+//      and the audible result (build-ups, collapses, plateaus) is the
+//      *trace* of that regulation, not a scripted gesture.
+//
+//   2. ECOLOGICAL COUPLING (medium, local)
+//      Each agent's filter cutoff is modulated by its neighbor's envelope.
+//      Agents are not independent voices; they are populations competing
+//      for the same finite energy budget the homeostat is trying to hold
+//      constant. Loud neighbors starve/brighten their neighbors.
+//
+//   3. CHAOTIC PERTURBATION (fast, structural)
+//      A logistic map (Xenakis-adjacent: deterministic chaos as a formal
+//      compositional resource) jitters delay lengths each control cycle,
+//      so the feedback network's resonant structure never fully locks —
+//      keeping the ecology from decaying into a static drone.
+//
+// Feed it a room mic (or any live source) at a conservative level and let
+// it run for minutes, not seconds. The interesting behavior is emergent
+// and slow, closer to Schaeffer's objet sonore arising from a process than
+// to a directly composed gesture.
+// ============================================================================
+
+slider1:input_gain=1<0,4,0.01>Input Gain (Room Mic)
+slider2:num_agents_f=5<1,8,1>Ecosystem Agents (Feedback Nodes)
+slider3:target_rms=0.1<0.001,0.5,0.001>Homeostatic Target Energy (RMS)
+slider4:adapt_rate=0.005<0.0001,0.05,0.0001>Homeostat Adaptation Rate
+slider5:coupling_amt=0.5<0,1,0.01>Inter-Agent Ecological Coupling
+slider6:chaos_rate=0.3<0,1,0.01>Chaotic Perturbation (Logistic Map)
+slider7:base_delay_ms=80<5,500,1>Base Delay Time (ms)
+slider8:feedback_base=0.85<0,1.2,0.01>Base Feedback Gain
+slider9:drywet=1<0,1,0.01>Dry / Wet
+slider10:reset_gate=0<0,1,1{Off,Reset}>Reset Ecosystem
+
+@init
+
+MAX_AGENTS = 8;
+PI = 3.141592653589793;
+GOLDEN_ANGLE = 2.399963229728653;
+
+maxdelay_ms = 500;
+maxdelay_samps = floor(maxdelay_ms/1000*srate) + 8;
+
+// -- flat memory allocation: each name below is a base pointer into the
+//    shared global memory space; foo[i] addresses (foo + i). --
+buf_base        = 0;
+wpos            = buf_base + MAX_AGENTS*maxdelay_samps;
+dlen            = wpos + MAX_AGENTS;
+dlen_base       = dlen + MAX_AGENTS;
+fbgain          = dlen_base + MAX_AGENTS;
+lp_state        = fbgain + MAX_AGENTS;
+cutoff_base     = lp_state + MAX_AGENTS;
+lp_coef         = cutoff_base + MAX_AGENTS;
+env             = lp_coef + MAX_AGENTS;
+lastout         = env + MAX_AGENTS;
+
+homeostat_gain  = 1;
+chaos_x         = 0.6789;
+measured_rms    = 0.001;
+rms_accum       = 0;
+ctrl_counter    = 0;
+control_interval = 512;
+prev_reset      = 0;
+
+function clear_ecosystem()
+(
+  i = 0;
+  while (i < MAX_AGENTS*maxdelay_samps) ( buf_base[i] = 0; i += 1; );
+  i = 0;
+  while (i < MAX_AGENTS) (
+    wpos[i] = 0; lp_state[i] = 0; env[i] = 0; lastout[i] = 0;
+    i += 1;
+  );
+  homeostat_gain = 1;
+  chaos_x = 0.6789;
+  measured_rms = 0.001;
+  rms_accum = 0;
+);
+
+clear_ecosystem();
+
+@slider
+
+num_agents = floor(max(1, min(num_agents_f, MAX_AGENTS)));
+
+// Reset trigger (edge-detected so it only fires once per toggle-up)
+(reset_gate > 0.5 && prev_reset <= 0.5) ? clear_ecosystem();
+prev_reset = reset_gate;
+
+// Spread agents across inharmonic delay ratios using the golden angle so
+// the feedback network has a diverse, non-resonant spectral population --
+// an "ecosystem" rather than a comb filter.
+i = 0;
+while (i < MAX_AGENTS) (
+  ratio = 1 + 0.7*sin(i*GOLDEN_ANGLE);
+  ms = base_delay_ms*ratio;
+  ms = max(2, min(ms, maxdelay_ms - 4));
+  dlen_base[i] = floor(ms/1000*srate);
+  dlen[i] = dlen_base[i];
+
+  cutoff_base[i] = 400 + 3600*(0.5 + 0.5*sin(i*GOLDEN_ANGLE*1.7));
+  fbgain[i] = feedback_base;
+
+  cf = min(cutoff_base[i], srate*0.45);
+  lp_coef[i] = 1 - exp(-2*PI*cf/srate);
+
+  i += 1;
+);
+
+@sample
+
+reset_gate > 0.5 ? (
+  spl0 = 0; spl1 = 0;
+) : (
+
+dry0 = spl0; dry1 = spl1;
+in_mono = (spl0 + spl1)*0.5*input_gain;
+
+sum_out = 0;
+
+i = 0;
+while (i < num_agents) (
+
+  rpos = wpos[i] - dlen[i];
+  rpos < 0 ? rpos += maxdelay_samps;
+  delayed = buf_base[buf_base + i*maxdelay_samps + rpos];
+
+  // per-agent damping (lowpass) -- the "metabolic loss" of the loop
+  lp_state[i] += lp_coef[i]*(delayed - lp_state[i]);
+  filtered = lp_state[i];
+
+  fb = fbgain[i]*homeostat_gain;
+  fb = max(0, min(fb, 1.25));
+
+  newval = in_mono/num_agents + filtered*fb;
+
+  buf_base[buf_base + i*maxdelay_samps + wpos[i]] = newval;
+  wpos[i] += 1;
+  wpos[i] >= maxdelay_samps ? wpos[i] = 0;
+
+  env[i] += 0.001*(abs(newval) - env[i]);
+  lastout[i] = newval;
+
+  sum_out += newval;
+  i += 1;
+);
+
+wet = sum_out / sqrt(max(num_agents,1));
+rms_accum += wet*wet;
+
+spl0 = dry0*(1-drywet) + wet*drywet;
+spl1 = dry1*(1-drywet) + wet*drywet;
+
+// -------------------- control-rate ecology update --------------------
+ctrl_counter += 1;
+ctrl_counter >= control_interval ? (
+  ctrl_counter = 0;
+
+  measured_rms = sqrt(rms_accum/control_interval);
+  rms_accum = 0;
+
+  // 1. HOMEOSTASIS: drive measured energy toward target_rms
+  error = target_rms - measured_rms;
+  homeostat_gain += adapt_rate*error*40;
+  homeostat_gain = max(0, min(homeostat_gain, 3));
+
+  // 3. CHAOS: logistic map, pushed toward the chaotic regime (r in 3.6..4.0)
+  //    by chaos_rate, jitters each agent's delay length.
+  r = 3.6 + chaos_rate*0.399;
+  chaos_x = r*chaos_x*(1-chaos_x);
+  (chaos_x <= 0.0001 || chaos_x >= 0.9999) ? chaos_x = 0.6789;
+
+  i = 0;
+  while (i < num_agents) (
+
+    jitter = (chaos_x - 0.5)*chaos_rate*0.08*dlen_base[i];
+    nd = dlen_base[i] + jitter;
+    dlen[i] = max(4, min(nd, maxdelay_samps - 4));
+
+    // 2. ECOLOGICAL COUPLING: neighbor's envelope brightens/dulls this
+    //    agent's filter -- agents compete for the shared energy budget.
+    neighbor = (i+1) % num_agents;
+    coupled_cutoff = cutoff_base[i]*(1 + coupling_amt*(env[neighbor] - target_rms)*6);
+    coupled_cutoff = max(80, min(coupled_cutoff, srate*0.45));
+    lp_coef[i] = 1 - exp(-2*PI*coupled_cutoff/srate);
+
+    i += 1;
+  );
+);
+
+);
+
+@gfx 420 160
+
+gfx_r=0.05; gfx_g=0.05; gfx_b=0.07; gfx_a=1;
+gfx_rect(0,0,gfx_w,gfx_h);
+
+// homeostat error indicator: green = balanced, red = hot, blue = starved
+err_disp = (measured_rms - target_rms) / max(target_rms,0.001);
+err_disp = max(-1, min(err_disp, 1));
+gfx_r = 0.3 + max(0,err_disp)*0.7;
+gfx_g = 0.3 + max(0,-err_disp)*0.2 + max(0,0.5-abs(err_disp))*0.4;
+gfx_b = 0.3 + max(0,-err_disp)*0.7;
+gfx_a = 1;
+gfx_x=8; gfx_y=6;
+gfx_drawstr("homeostat gain:");
+gfx_x=140; gfx_y=6;
+gfx_printf("%.3f", homeostat_gain);
+gfx_x=8; gfx_y=20;
+gfx_drawstr("measured RMS / target:");
+gfx_x=180; gfx_y=20;
+gfx_printf("%.4f / %.4f", measured_rms, target_rms);
+gfx_x=8; gfx_y=34;
+gfx_drawstr("chaos state:");
+gfx_x=140; gfx_y=34;
+gfx_printf("%.4f", chaos_x);
+
+barw = (gfx_w - 20) / MAX_AGENTS;
+i = 0;
+while (i < MAX_AGENTS) (
+  active = i < num_agents;
+  h = min(env[i]*400, gfx_h - 60);
+  x = 10 + i*barw;
+  y = gfx_h - 10 - h;
+  active ? (
+    gfx_r = 0.25 + 0.6*(i/MAX_AGENTS);
+    gfx_g = 0.65;
+    gfx_b = 0.85 - 0.5*(i/MAX_AGENTS);
+    gfx_a = 1;
+  ) : (
+    gfx_r=0.15; gfx_g=0.15; gfx_b=0.18; gfx_a=1;
+  );
+  gfx_rect(x, y, barw-4, h);
+  i += 1;
+);

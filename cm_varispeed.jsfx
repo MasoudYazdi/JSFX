@@ -1,0 +1,61 @@
+desc:CM Varispeed (Phonogene-style Tape Speed)
+// Concrete Music Suite -- continuously records input into a circular
+// buffer and reads it back at an independently controllable speed and
+// direction, emulating variable-speed tape transport (cf. Pierre
+// Schaeffer's Phonogene / the "acceleration-deceleration" transformation).
+// Negative speed = reverse playback. Speed != 1 couples pitch and time,
+// exactly as on tape.
+
+slider1:speed=1<-4,4,0.001>Tape Speed (x)
+slider2:buflen=10<1,30,0.1>Buffer Length (sec)
+slider3:record=1<0,1,1{Off,On}>Record Input
+slider4:freeze=0<0,1,1{Off,On}>Freeze Read Head
+slider5:readoffset=0<-1,1,0.0001>Manual Head Position Nudge
+
+in_pin:Left
+in_pin:Right
+out_pin:Left
+out_pin:Right
+
+@init
+buf_L = 0;
+maxbuf = srate*30;
+buf_R = buf_L + maxbuf;
+writepos = 0;
+readpos = 0.0;
+last_freeze = 0;
+
+@slider
+buflen_samples = buflen*srate;
+buflen_samples >= maxbuf ? buflen_samples = maxbuf - 1;
+
+@sample
+record ? (
+  buf_L[writepos] = spl0;
+  buf_R[writepos] = spl1;
+);
+writepos += 1;
+writepos >= buflen_samples ? writepos = 0;
+
+// manual nudge is applied once per edge (slider drag), not continuously
+readoffset != 0 ? (
+  readpos += readoffset*buflen_samples;
+  readoffset = 0;
+  sliderchange(readoffset);
+);
+
+readspeed = freeze ? 0 : speed;
+
+ridx = floor(readpos);
+frac = readpos - ridx;
+idx0 = ridx % buflen_samples;
+idx0 < 0 ? idx0 += buflen_samples;
+idx1 = idx0 + 1;
+idx1 >= buflen_samples ? idx1 = 0;
+
+spl0 = buf_L[idx0]*(1-frac) + buf_L[idx1]*frac;
+spl1 = buf_R[idx0]*(1-frac) + buf_R[idx1]*frac;
+
+readpos += readspeed;
+readpos >= buflen_samples ? readpos -= buflen_samples;
+readpos < 0 ? readpos += buflen_samples;

@@ -1,0 +1,92 @@
+desc:UPIC-style Trajectory Drawing (mouse-drawn CV)
+slider1:npoints=400<32,1024,1>Buffer Resolution
+slider2:dur=2<0.1,10,0.01>Trajectory Duration (s)
+slider3:mode=0<0,1,1{Pitch CV,Amplitude CV}>Output Mode
+slider4:pitchlo=48<0,127,1>Pitch Range Low (MIDI)
+slider5:pitchhi=84<0,127,1>Pitch Range High (MIDI)
+slider6:loop=1<0,1,1{One-shot,Loop}>Playback Mode
+
+@init
+MAXPTS = 1024;
+traj = 0;
+i = 0;
+while (i < MAXPTS) ( traj[i] = 0.5; i += 1 );
+last_mx = -1;
+last_my_val = 0.5;
+play_pos = 0;
+osc_phase = 0;
+
+function draw_point(idx, val)
+(
+  idx >= 0 && idx < npoints ? traj[idx] = max(0, min(1, val));
+);
+
+@gfx 600 300
+gfx_clear = 0x101010;
+gfx_set(0.3,0.3,0.3,1);
+gfx_line(0, gfx_h*0.5, gfx_w, gfx_h*0.5);
+
+gfx_set(0.2, 0.9, 0.6, 1);
+i = 0;
+while (i < npoints-1) (
+  x0 = gfx_w * i/npoints;      y0 = gfx_h * (1 - traj[i]);
+  x1 = gfx_w * (i+1)/npoints;  y1 = gfx_h * (1 - traj[i+1]);
+  gfx_line(x0, y0, x1, y1);
+  i += 1;
+);
+
+gfx_set(1,1,1,0.5);
+cursor_x = gfx_w * (play_pos/npoints);
+gfx_line(cursor_x, 0, cursor_x, gfx_h);
+
+// Left-drag draws into the buffer. We interpolate between the last mouse
+// position and the current one so a fast drag doesn't leave gaps in the
+// trajectory - the same problem UPIC's original stylus digitizer had to
+// solve at the hardware level.
+mouse_cap & 1 ? (
+  mx = mouse_x; my = mouse_y;
+  idx = floor(npoints * mx/gfx_w);
+  val = 1 - my/gfx_h;
+  last_mx >= 0 ? (
+    lidx = floor(npoints * last_mx/gfx_w);
+    steps = abs(idx - lidx);
+    steps > 0 ? (
+      s = 0;
+      while (s <= steps) (
+        t = s/steps;
+        draw_point(lidx + (idx-lidx)*t, last_my_val + (val-last_my_val)*t);
+        s += 1;
+      );
+    ) : draw_point(idx, val);
+  ) : draw_point(idx, val);
+  last_mx = mx; last_my_val = val;
+) : (
+  last_mx = -1;
+);
+
+@sample
+step = npoints / (dur*srate);
+play_pos += step;
+play_pos >= npoints ? (
+  loop ? play_pos -= npoints : play_pos = npoints-1;
+);
+
+idx0 = floor(play_pos);
+idx1 = min(idx0+1, npoints-1);
+frac = play_pos - idx0;
+cv = traj[idx0] + (traj[idx1]-traj[idx0])*frac;
+
+mode == 0 ? (
+  note = pitchlo + cv*(pitchhi-pitchlo);
+  cur_freq = 440*pow(2,(note-69)/12);
+  osc_phase += cur_freq/srate;
+  osc_phase -= floor(osc_phase);
+  sig = sin(2*$pi*osc_phase)*0.4;
+) : (
+  sig = sin(2*$pi*osc_phase)*cv*0.4;
+  osc_phase += 220/srate;
+  osc_phase -= floor(osc_phase);
+);
+
+spl0 = sig;
+spl1 = sig;

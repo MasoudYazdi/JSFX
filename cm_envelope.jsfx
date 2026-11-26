@@ -1,0 +1,47 @@
+desc:CM Envelope Transformer (Dynamique)
+// Concrete Music Suite -- reshapes the amplitude envelope independently
+// of the sound's spectral content: fast/slow attack imposition, gating,
+// envelope inversion, and tremolo. Models Schaeffer's "jeu des
+// dynamiques" -- stripping a sound of its natural attack/decay and
+// imposing an artificial one (e.g. making a struck sound swell instead
+// of snap, or turning a sustained tone into a percussive gesture).
+
+slider1:attack=10<0.1,2000,0.1>Attack Time (ms)
+slider2:release=200<0.1,3000,0.1>Release Time (ms)
+slider3:threshold=-40<-60,0,0.1>Gate Threshold (dB)
+slider4:invert=0<0,1,1{Normal,Invert Envelope}>Envelope Mode
+slider5:tremrate=0<0,20,0.01>Tremolo Rate (Hz)
+slider6:tremdepth=0<0,1,0.01>Tremolo Depth
+slider7:makeup=1<0,4,0.01>Makeup Gain
+
+in_pin:Left
+in_pin:Right
+out_pin:Left
+out_pin:Right
+
+@init
+env = 0;
+tremphase = 0;
+
+@slider
+athresh = pow(10, threshold/20);
+atk_coef = exp(-1/(0.001*attack*srate));
+rel_coef = exp(-1/(0.001*release*srate));
+
+@sample
+inlevel = max(abs(spl0), abs(spl1));
+inlevel > env ? env = atk_coef*env + (1-atk_coef)*inlevel
+              : env = rel_coef*env + (1-rel_coef)*inlevel;
+
+clipenv = env > 1 ? 1 : env;
+gateenv = clipenv > athresh ? clipenv : 0;
+
+tremphase += 2*$pi*tremrate/srate;
+tremphase >= 2*$pi ? tremphase -= 2*$pi;
+trem = 1 - tremdepth*0.5*(1-cos(tremphase));
+
+outenv = invert ? (1-gateenv) : gateenv;
+gain = outenv*makeup*trem;
+
+spl0 = spl0*gain;
+spl1 = spl1*gain;

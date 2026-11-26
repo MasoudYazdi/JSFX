@@ -1,0 +1,256 @@
+desc:CG DelayNet - routable network of up to 8 delay nodes (ring, ping-pong, star, cascade, dense, random, gravity); provably bounded feedback
+tags:musique-concrete delay network feedback live
+slider1:0<0,6,1{Ring,Ping-Pong Pairs,Star,Cascade,Dense,Random Sparse,Gravity}>Topology
+slider2:6<2,8,1>Nodes
+slider3:420<20,2000,1:log>Time Base (ms)
+slider4:1<0,3,1{Even,Golden,Primes,Random (seed)}>Time Pattern
+slider5:0.7<0,0.95,0.001>Feedback
+slider6:0<0,1,1{Off,HOLD (freeze network)}>Hold
+slider7:6000<500,16000,1:log>Node Low-pass (Hz)
+slider8:100<20,2000,1:log>Node High-pass (Hz)
+slider9:0.5<0,2,0.01>Filter Spread (octaves across nodes)
+slider10:0.3<0,1,0.01>Saturation
+slider11:5<0,30,0.1>Drift (ms)
+slider12:400<20,2000,1:log>Time Slew (ms)
+slider13:0<0,3,1{All nodes,First node,Alternate nodes,Last node}>Input Injection
+slider14:0.3<0,1,0.01>Duck By Input
+slider15:0.8<0,1,0.01>Stereo Width
+slider16:1<1,999,1>Seed (Random topology / pattern)
+slider17:-3<-60,6,0.1>Wet (dB)
+slider18:0<-60,6,0.1>Dry (dB)
+slider19:0<0,3,1{Auto,L,R,L+R}>Input
+slider20:1<1,4,1>Analysis Bus (1-4)
+slider21:0<0,10,1{None,Level,Onset,Brightness,Noisiness,Flux,Pitch,Mod 1,Mod 2,Mod 3,Mod 4}>Mod Source
+slider22:0<-0.4,0.4,0.01>Mod -> Feedback
+slider23:0<-1,1,0.01>Mod -> Time (octaves)
+slider24:0<0,1,1{-,PANIC}>Panic / Clear
+
+in_pin:Input L
+in_pin:Input R
+out_pin:Output L
+out_pin:Output R
+options:gmem=CGbus no_meter
+
+@init
+
+ext_noinit=1;
+PI=3.141592653589793; TWOPI=6.283185307179586; CEIL=2;
+
+// ---- NaN-safe primitives. Comparisons with NaN are false, so every function below maps NaN/inf to a finite value ----
+function lim(x,lo,hi) ( x>=lo ? (x<=hi ? x : hi) : lo );
+function fin(x) ( abs(x)<100000 ? x : 0 );
+function db2lin(d) ( exp(lim(d,-120,60)*0.11512925464970229) );
+function dbgain(d) ( d<=-59.9 ? 0 : db2lin(d) );
+function lin2db(x) ( 8.685889638065035*log(abs(x)+0.000000001) );
+function sat(x) ( abs(x)<3 ? x*(27+x*x)/(27+9*x*x) : (x>0 ? 1 : -1) );
+function sclip(x,c) local(ax,k,y) ( ax=abs(x); k=c*0.7; y=ax<k ? ax : k+(c-k)*sat((ax-k)/(c-k)); x<0 ? -y : y );
+function mixf(a,b,t) ( a+(b-a)*t );
+function lpc(fc) ( 1-exp(-TWOPI*lim(fc,1,srate*0.45)/srate) );
+function smooth01(t) ( t<=0 ? 0 : (t>=1 ? 1 : t*t*(3-2*t)) );
+function rnd() ( rng=rng*1664525+1013904223; rng-=floor(rng/4294967296)*4294967296; rng/4294967296 );
+function rnds() ( rnd()*2-1 );
+function alloc(sz) local(p) ( p=mp; mp+=sz; memset(p,0,sz); p );
+
+// ---- mono input pick (guitar usually lives on one channel) + DC block ----
+function pick_in() local(yy) (
+  eL+=(inL*inL-eL)*0.0005; eR+=(inR*inR-eR)*0.0005;
+  imode<0.5 ? ( xm = eR<0.0005*eL ? inL : (eL<0.0005*eR ? inR : (inL+inR)*0.5) )
+  : ( imode<1.5 ? ( xm=inL ) : ( imode<2.5 ? ( xm=inR ) : ( xm=(inL+inR)*0.5 ) ) );
+  yy=xm-dcx+dcr*dcy; dcx=xm; dcy=yy; xm=fin(yy);
+);
+
+// ---- onset detector (fast/slow envelope ratio with refractory time) ----
+function ons_proc(x) local(a) (
+  a=abs(x);
+  ons_f+=(a-ons_f)*(a>ons_f ? ons_kfa : ons_kfr);
+  ons_s+=(a-ons_s)*(a>ons_s ? ons_ksa : ons_ksr);
+  ons_ev=0;
+  ons_cool>0 ? ons_cool-=1;
+  (ons_cool<=0 && ons_f>ons_thr && ons_f>ons_s*ons_ratio) ? ( ons_ev=1; ons_cool=ons_refr; ons_cnt+=1; );
+);
+
+// ---- analysis bus (written by CG_Analyzer, optional for every other module) ----
+function bus_update() (
+  bus_b=(lim(floor(bus_sel+0.5),1,4)-1)*16;
+  hb=gmem[bus_b];
+  abs(hb-hb_last)>0.5 ? ( hb_last=hb; bus_stale=0; ) : ( bus_stale+=samplesblock; );
+  bus_alive=bus_stale<srate*0.4;
+  mb=gmem[bus_b+15];
+  abs(mb-mb_last)>0.5 ? ( mb_last=mb; mbus_stale=0; ) : ( mbus_stale+=samplesblock; );
+  mbus_alive=mbus_stale<srate*0.4;
+);
+// sel 1..6 = Analyzer streams, 7..10 = Modulator lanes 1..4 (bus slots 11..14). Everything is clamped 0..1.
+function bus_get(sel) local(s) ( s=floor(sel+0.5); s<0.5 ? 0 : ( s<=6.5 ? (bus_alive ? lim(gmem[bus_b+s],0,1) : 0) : (mbus_alive ? lim(gmem[bus_b+s+4],0,1) : 0) ) );
+function bus_onset() local(c,r) ( r=0; bus_alive ? ( c=gmem[bus_b+10]; abs(c-bus_cnt_last)>0.5 ? ( r=1; bus_cnt_last=c; ); ); r );
+mp=0;
+
+NN=8;
+DLM=floor(srate*2.1)+16;
+dbuf=alloc(NN*DLM);
+dsm=alloc(NN); drf=alloc(NN); drt=alloc(NN); tenb=alloc(NN); Mt=alloc(NN*NN); Mc=alloc(NN*NN); rr_=alloc(NN*NN);
+flp=alloc(NN); fhp=alloc(NN); vv=alloc(NN); injw=alloc(NN); injc=alloc(NN); pl_=alloc(NN); pr_=alloc(NN);
+rtio=alloc(NN); lkc=alloc(NN); prm=alloc(NN);
+prm[0]=2; prm[1]=3; prm[2]=5; prm[3]=7; prm[4]=11; prm[5]=13; prm[6]=17; prm[7]=19;
+wp=0; ncnt=6; fb=0.7; hold=0; topo=0; pat=1; tbase=0.42*srate; lt=log(0.42*srate); k_sl=0.001; khp=0.01; width=0.8; seed=1; seed_prev=-1;
+md_fb=0; md_t=0; env=0; ctl=0; dn=0.000000000000001; spread=0.5; injm=0; lpbase=6000; mt_dirty=1;
+k_env_a=1-exp(-1/(0.005*srate)); k_env_r=1-exp(-1/(0.15*srate)); k_dr=1-exp(-1/(0.4*srate)); dr_cnt=0; k_matT=1-exp(-16/(0.06*srate));
+i=0; while(i<NN) ( dsm[i]=lt; rtio[i]=(i+1)/NN; i+=1; );
+
+function do_clear() ( memset(dbuf,0,NN*DLM); memset(flp,0,NN); memset(fhp,0,NN); memset(vv,0,NN); );
+
+// builds target routing matrix Mt from topology; every row sums (in absolute value) to the feedback amount => loop gain bound < 1
+function build_net() local(i,j,k,s,a,b,cnt,pmax) (
+  memset(rr_,0,NN*NN);
+  // time ratios (all <= 1)
+  rng=seed*7919+13;
+  i=0; while(i<ncnt) (
+    pat<0.5 ? ( rtio[i]=(i+1)/ncnt; ) :
+    ( pat<1.5 ? ( rtio[i]=pow(0.618,ncnt-1-i); ) :
+    ( pat<2.5 ? ( rtio[i]=prm[i]/prm[ncnt-1]; ) : ( rtio[i]=0.15+0.85*rnd(); ) ) );
+    i+=1;
+  );
+  i=0; while(i<ncnt) (
+    topo<0.5 ? ( rr_[i*NN+((i+ncnt-1)%ncnt)]=1; ) :
+    ( topo<1.5 ? ( j=i^1; j>=ncnt ? (j=(i+ncnt-1)%ncnt); rr_[i*NN+j]=1; ) :
+    ( topo<2.5 ? ( i==0 ? ( j=1; while(j<ncnt) ( rr_[j]=1; j+=1; ); ) : ( rr_[i*NN]=1; ); ) :
+    ( topo<3.5 ? ( i>0 ? ( rr_[i*NN+i-1]=1; ) : ( rr_[ncnt-1]=0.3; ); ) :
+    ( topo<4.5 ? ( j=0; while(j<ncnt) ( j!=i ? ( rr_[i*NN+j]=1; ); j+=1; ); ) :
+    ( topo<5.5 ? ( j=0; while(j<ncnt) ( (j!=i && rnd()<0.4) ? ( rr_[i*NN+j]=rnd(); ); j+=1; ); ) :
+    ( j=0; while(j<ncnt) ( j!=i ? ( rr_[i*NN+j]=1/(1+8*abs(log(rtio[i])-log(rtio[j]))); ); j+=1; ); ) ) ) ) ) );
+    // normalise row; empty rows get a ring link
+    s=0; j=0; while(j<ncnt) ( s+=rr_[i*NN+j]; j+=1; );
+    s<=0.000001 ? ( rr_[i*NN+((i+ncnt-1)%ncnt)]=1; s=1; );
+    j=0; while(j<NN) ( Mt[i*NN+j]=(j<ncnt && i<ncnt) ? fb*rr_[i*NN+j]/s : 0; j+=1; );
+    i+=1;
+  );
+  i=ncnt; while(i<NN) ( j=0; while(j<NN) ( Mt[i*NN+j]=0; j+=1; ); i+=1; );
+  // input injection weights
+  i=0; while(i<NN) (
+    a=0;
+    i<ncnt ? (
+      injm<0.5 ? ( a=1.2/sqrt(ncnt); ) :
+      ( injm<1.5 ? ( a=i==0 ? 1 : 0; ) :
+      ( injm<2.5 ? ( a=(i&1) ? 0 : 1.4/sqrt(max(1,ncnt*0.5)); ) : ( a=i==ncnt-1 ? 1 : 0; ) ) );
+    );
+    injw[i]=a;
+    b=((i+0.5)/ncnt)*2-1; b=b*width*(i&1 ? 1 : -1); b=(b*0.5+0.5)*1.5707963267948966; pl_[i]=cos(b); pr_[i]=sin(b);
+    i+=1;
+  );
+);
+
+function read_params() (
+
+bus_sel=slider20; imode=slider19; msel=slider21;
+T_wet=dbgain(slider17); T_dry=dbgain(slider18);
+md_fb=lim(slider22,-0.4,0.4); md_t=lim(slider23,-1,1); mod_t=bus_get(msel);
+hold=slider6>0.5;
+fbn=hold ? 0.999 : lim(lim(slider5,0,0.95)+md_fb*mod_s,0,0.95);
+T_ing=hold ? 0 : 1;
+T_duck=lim(slider14,0,1); T_sat=lim(slider10,0,1); T_drift=lim(slider11,0,30);
+newnn=lim(floor(slider2+0.5),2,8); newtopo=slider1; newpat=slider4; newinj=slider13; newwid=lim(slider15,0,1);
+newseed=lim(floor(slider16+0.5),1,999);
+(mt_dirty>0.5 || newnn!=ncnt || newtopo!=topo || newpat!=pat || newinj!=injm || newwid!=width || newseed!=seed || abs(fbn-fb)>0.0005) ? (
+  ncnt=newnn; topo=newtopo; pat=newpat; injm=newinj; width=newwid; seed=newseed; fb=fbn; build_net(); mt_dirty=0;
+);
+tbase=lim(slider3,20,2000)*exp(md_t*mod_s*0.6931471805599453)*0.001*srate; tbase=lim(tbase,16,srate*2.0);
+k_sl=1-exp(-1/(lim(slider12,20,2000)*0.001*srate));
+spread=lim(slider9,0,2); lpbase=lim(slider7,500,16000);
+khp=lpc(lim(slider8,20,2000));
+i=0; while(i<NN) (
+  lkc[i]=lpc(lim(lpbase*pow(2,spread*(ncnt>1 ? ((i/(ncnt-1))*2-1) : 0)),300,18000));
+  i+=1;
+);
+
+);
+function copy_params() ( P_wet=T_wet; P_dry=T_dry; P_duck=T_duck; P_sat=T_sat; P_drift=T_drift; P_ing=T_ing; );
+
+// ---- panic machine: fade wet out, clear every buffer, fade back in. Triggered by button or by internal watchdog ----
+function panic_step() (
+  (panic_req>0.5 && pan_ph==0) ? ( pan_ph=1; );
+  panic_req=0;
+  pan_ph==1 ? ( pan_g-=pan_dn; pan_g<=0 ? ( pan_g=0; do_clear(); pan_ph=2; pan_hold=floor(0.03*srate); ); );
+  pan_ph==2 ? ( pan_hold-=1; pan_hold<=0 ? ( pan_ph=3; ); );
+  pan_ph==3 ? ( pan_g+=pan_up; pan_g>=1 ? ( pan_g=1; pan_ph=0; ); );
+  pan_gs=pan_g*pan_g*(3-2*pan_g);
+);
+
+// ---- final stage: wet DC block, dry/wet sum, finite scrub, soft ceiling at +6 dB ----
+function finish() local(yy) (
+  wL=fin(wL); wR=fin(wR);
+  yy=wL-wxL+dcr*wyL; wxL=wL; wyL=yy; wL=yy;
+  yy=wR-wxR+dcr*wyR; wxR=wR; wyR=yy; wR=yy;
+  oL=sclip(fin(inL*P_dry+wL*P_wet*pan_gs),CEIL);
+  oR=sclip(fin(inR*P_dry+wR*P_wet*pan_gs),CEIL);
+  spl0=oL; spl1=oR;
+);
+
+smc=1-exp(-1/(0.015*srate));
+kmod=1-exp(-1/(0.004*srate));
+dcr=1-TWOPI*10/srate;
+pan_dn=1/(0.01*srate); pan_up=1/(0.05*srate); pan_g=1; pan_gs=1; pan_ph=0; panic_req=0;
+ons_kfa=1-exp(-1/(0.001*srate)); ons_kfr=1-exp(-1/(0.025*srate));
+ons_ksa=1-exp(-1/(0.040*srate)); ons_ksr=1-exp(-1/(0.250*srate));
+ons_ratio=2.2; ons_thr=db2lin(-52); ons_refr=floor(0.07*srate);
+bus_sel=1; imode=0; pfirst=1;
+rng=7023;
+
+@block
+
+bus_update();
+pan_btn=slider24; (pan_btn>0.5 && pan_prev<0.5) ? ( panic_req=1; ); pan_prev=pan_btn;
+read_params();
+pfirst ? ( copy_params(); pfirst=0; );
+
+
+@sample
+
+inL=fin(spl0); inR=fin(spl1);
+pick_in();
+ons_proc(xm);
+panic_step();
+mod_s+=(mod_t-mod_s)*kmod;
+P_wet+=(T_wet-P_wet)*smc;
+P_dry+=(T_dry-P_dry)*smc;
+P_duck+=(T_duck-P_duck)*smc;
+P_sat+=(T_sat-P_sat)*smc;
+P_drift+=(T_drift-P_drift)*smc;
+P_ing+=(T_ing-P_ing)*smc;
+
+dn=-dn;
+dr_cnt-=1;
+dr_cnt<=0 ? ( dr_cnt=floor(srate*0.3*(0.5+rnd())); i=0; while(i<NN) ( drt[i]=rnds(); i+=1; ); );
+// matrix glide (control-rate) so topology / feedback changes never click
+(ctl+=1)>=16 ? ( ctl=0; i=0; while(i<NN*NN) ( Mc[i]+=(Mt[i]-Mc[i])*k_matT; i+=1; ); i=0; while(i<NN) ( injc[i]+=(injw[i]-injc[i])*0.05; i+=1; ); );
+// read nodes
+oL=0; oR=0; i=0;
+while(i<NN) (
+  tenb[i]+=(lim(ncnt-i,0,1)-tenb[i])*smc;
+  dsm[i]+=((log(max(tbase*rtio[i],16)))-dsm[i])*k_sl; dsm[i]=lim(dsm[i],2.7,13);
+  drf[i]+=(drt[i]-drf[i])*k_dr;
+  Dm=lim(exp(dsm[i])+drf[i]*P_drift*0.001*srate,16,DLM-8);
+  base=dbuf+i*DLM;
+  rp=wp-Dm; rp<0 ? (rp+=DLM);
+  i0=floor(rp); fr=rp-i0; i1=i0+1; i1>=DLM ? (i1=0); i0>=DLM ? (i0=DLM-1); i0<0 ? (i0=0);
+  v=base[i0]*(1-fr)+base[i1]*fr;
+  flp[i]+=lkc[i]*(v-flp[i]); fhp[i]+=khp*(flp[i]-fhp[i]);
+  f=flp[i]-fhp[i];
+  dd=1+4*P_sat; f=mixf(f,sat(f*dd)/dd,P_sat);       // gain-neutral soft saturation: |out| <= |in|
+  vv[i]=lim(fin(f),-3,3)*tenb[i];
+  oL+=vv[i]*pl_[i]; oR+=vv[i]*pr_[i];
+  abs(flp[i])<50 ? 0 : ( panic_req=1; );
+  i+=1;
+);
+// write nodes: injected guitar + routed network (each row sums to <= feedback)
+i=0;
+while(i<NN) (
+  acc=0; j=0; while(j<NN) ( acc+=Mc[i*NN+j]*vv[j]; j+=1; );
+  dbuf[i*DLM+wp]=sclip(xm*P_ing*injc[i]+acc+dn,2);
+  i+=1;
+);
+wp+=1; wp>=DLM ? (wp=0);
+ax=abs(xm); env+=(ax-env)*(ax>env ? k_env_a : k_env_r);
+dg=1-P_duck*lim(env*5,0,1);
+wL=oL*0.6*dg; wR=oR*0.6*dg;
+(abs(wL)<20 && abs(wR)<20) ? 0 : ( panic_req=1; wL=0; wR=0; );
+finish();
+

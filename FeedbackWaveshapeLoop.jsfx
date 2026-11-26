@@ -1,0 +1,280 @@
+desc:Feedback Waveshaping Loops (Custom Curve)
+//tags: waveshaper feedback distortion nonlinear
+//author: Mass / Claude
+// Stereo effect. Two cascaded feedback waveshaping loops share one
+// hand-drawable transfer curve (drag in the GFX window to edit it).
+
+slider1:drive_db=0<-24,24,0.1>Drive (dB)
+slider2:fb1_target=0.3<-0.99,0.99,0.001>Feedback Loop 1
+slider3:fb2_target=0<-0.99,0.99,0.001>Feedback Loop 2
+slider4:mix_target=0<0,1,0.001>Loop 1 / Loop 2 Blend
+slider5:outlevel_db=0<-24,24,0.1>Output Level (dB)
+slider6:dcblock_on=1<0,1,1{Off,On}>DC Blocker
+slider7:oversample_on=0<0,1,1{Off,2x}>Oversampling
+slider8:preset=0<0,5,1{Custom,Linear,Tanh,Sine Fold,Hard Clip,Stairstep}>Curve Preset
+slider9:satlim_target=3<1,8,0.01>Feedback Safety Limit
+
+@init
+
+ws_size = 512;
+ws_table = 0;
+ws_table_prev = ws_table + ws_size;
+fbstate = ws_table_prev + ws_size;
+trace_len = 256;
+trace_buf = fbstate + 8;
+
+inited == 0 ? (
+  i = 0;
+  while (i < ws_size) (
+    ws_table[i] = (i/(ws_size-1))*2 - 1;
+    ws_table_prev[i] = ws_table[i];
+    i += 1;
+  );
+  i = 0;
+  while (i < 8) ( fbstate[i] = 0; i += 1; );
+  i = 0;
+  while (i < trace_len) ( trace_buf[i] = 0; i += 1; );
+  trace_idx = 0;
+  last_preset = 0;
+  xfade_active = 0;
+  xfade_pos = 0;
+  xfade_frac = 1;
+  prevInL = 0;
+  prevInR = 0;
+  drive_lin = 1;
+  fb1_s = fb1_target;
+  fb2_s = fb2_target;
+  mix_s = mix_target;
+  outlvl_lin = 1;
+  satlim_s = satlim_target;
+  lastX = 0;
+  lastY = 0;
+  drawing = 0;
+  right_down_prev = 0;
+  inited = 1;
+);
+
+// -- table lookup with linear interpolation, over an arbitrary table base --
+function ws_lookup_tab(v, tab) local(pos, i0, i1, frac, y0, y1) (
+  v = max(-1, min(1, v));
+  pos = (v+1)*0.5*(ws_size-1);
+  i0 = floor(pos);
+  i0 = max(0, min(ws_size-2, i0));
+  i1 = i0 + 1;
+  frac = pos - i0;
+  y0 = tab[i0];
+  y1 = tab[i1];
+  y0 + (y1-y0)*frac;
+);
+
+// -- active lookup: crossfades old->new curve for ~20ms after a preset swap --
+function ws_lookup(v) (
+  xfade_active ? (
+    ws_lookup_tab(v, ws_table_prev)*(1-xfade_frac) + ws_lookup_tab(v, ws_table)*xfade_frac;
+  ) : (
+    ws_lookup_tab(v, ws_table);
+  );
+);
+
+// -- smooth asymptotic limiter, used both on feedback state and final output --
+function soft_limit(v, lim) local(a) (
+  lim <= 0 ? lim = 0.0001;
+  a = v/lim;
+  lim*(a/(1+abs(a)));
+);
+
+function gen_preset(p) local(i, x, y, steps) (
+  i = 0;
+  while (i < ws_size) (
+    x = (i/(ws_size-1))*2 - 1;
+    p == 1 ? ws_table[i] = x;
+    p == 2 ? (
+      y = 3*x;
+      ws_table[i] = (exp(2*y)-1)/(exp(2*y)+1);
+    );
+    p == 3 ? ws_table[i] = sin(x*4.71238898);
+    p == 4 ? ws_table[i] = (x > 0.3 ? 1 : (x < -0.3 ? -1 : x/0.3));
+    p == 5 ? (
+      steps = 8;
+      ws_table[i] = floor(x*steps + 0.5)/steps;
+    );
+    i += 1;
+  );
+);
+
+// -- one channel, one sample: two cascaded feedback waveshaping loops --
+function process_sample(x, base) local(s1, s2, y1, y2, out, dx1, dy1, out2) (
+  x *= drive_lin;
+
+  s1 = fbstate[base];
+  y1 = ws_lookup(x + fb1_s*s1);
+  fbstate[base] = soft_limit(y1, satlim_s);
+
+  s2 = fbstate[base+1];
+  y2 = ws_lookup(y1 + fb2_s*s2);
+  fbstate[base+1] = soft_limit(y2, satlim_s);
+
+  out = y1*(1-mix_s) + y2*mix_s;
+
+  dcblock_on ? (
+    dx1 = fbstate[base+2];
+    dy1 = fbstate[base+3];
+    out2 = out - dx1 + 0.9975*dy1;
+    fbstate[base+2] = out;
+    fbstate[base+3] = out2;
+    out = out2;
+  );
+
+  base == 0 ? (
+    lastX = x + fb1_s*s1;
+    lastY = y1;
+  );
+
+  soft_limit(out, 1);
+);
+
+@slider
+
+drive_target = pow(10, drive_db/20);
+outlvl_target = pow(10, outlevel_db/20);
+
+preset != last_preset ? (
+  preset != 0 ? (
+    i = 0;
+    while (i < ws_size) ( ws_table_prev[i] = ws_table[i]; i += 1; );
+    gen_preset(preset);
+    xfade_active = 1;
+    xfade_pos = 0;
+    xfade_frac = 0;
+  );
+  last_preset = preset;
+);
+
+@block
+
+smoothcoef = exp(-1/(0.005*srate));
+xfade_len = max(1, floor(0.02*srate));
+
+@sample
+
+drive_lin  += (drive_target  - drive_lin)*(1-smoothcoef);
+fb1_s      += (fb1_target    - fb1_s)*(1-smoothcoef);
+fb2_s      += (fb2_target    - fb2_s)*(1-smoothcoef);
+mix_s      += (mix_target    - mix_s)*(1-smoothcoef);
+outlvl_lin += (outlvl_target - outlvl_lin)*(1-smoothcoef);
+satlim_s   += (satlim_target - satlim_s)*(1-smoothcoef);
+
+xfade_active ? (
+  xfade_pos += 1;
+  xfade_frac = min(1, xfade_pos/xfade_len);
+  xfade_pos >= xfade_len ? xfade_active = 0;
+);
+
+rawL = spl0;
+rawR = spl1;
+
+oversample_on ? (
+  midL = (prevInL + rawL)*0.5;
+  midR = (prevInR + rawR)*0.5;
+  process_sample(midL, 0);
+  spl0 = process_sample(rawL, 0);
+  process_sample(midR, 4);
+  spl1 = process_sample(rawR, 4);
+) : (
+  spl0 = process_sample(rawL, 0);
+  spl1 = process_sample(rawR, 4);
+);
+
+prevInL = rawL;
+prevInR = rawR;
+
+spl0 *= outlvl_lin;
+spl1 *= outlvl_lin;
+
+trace_buf[trace_idx] = lastY;
+trace_idx += 1;
+trace_idx >= trace_len ? trace_idx = 0;
+
+@gfx 420 480
+
+gfx_set(0.08, 0.08, 0.10, 1);
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+plot_size = min(gfx_w - 20, gfx_h - 70);
+plot_x = (gfx_w - plot_size)*0.5;
+plot_y = 10;
+
+gfx_set(0.14, 0.14, 0.17, 1);
+gfx_rect(plot_x, plot_y, plot_size, plot_size);
+
+gfx_set(0.28, 0.28, 0.32, 1);
+gfx_line(plot_x, plot_y + plot_size*0.5, plot_x + plot_size, plot_y + plot_size*0.5);
+gfx_line(plot_x + plot_size*0.5, plot_y, plot_x + plot_size*0.5, plot_y + plot_size);
+
+gfx_set(0.22, 0.22, 0.26, 1);
+gfx_line(plot_x, plot_y + plot_size, plot_x + plot_size, plot_y);
+
+gfx_set(0.4, 0.85, 1, 1);
+i = 0;
+px = plot_x;
+py = plot_y + plot_size*(1 - (ws_table[0]+1)*0.5);
+while (i < ws_size) (
+  vx = plot_x + plot_size*(i/(ws_size-1));
+  vy = plot_y + plot_size*(1 - (ws_table[i]+1)*0.5);
+  gfx_line(px, py, vx, vy);
+  px = vx;
+  py = vy;
+  i += 1;
+);
+
+gfx_set(1, 0.55, 0.2, 1);
+dotx = plot_x + plot_size*((max(-1,min(1,lastX))+1)*0.5);
+doty = plot_y + plot_size*(1 - (max(-1,min(1,lastY))+1)*0.5);
+gfx_circle(dotx, doty, 4, 1, 1);
+
+in_box = mouse_x >= plot_x && mouse_x <= plot_x + plot_size && mouse_y >= plot_y && mouse_y <= plot_y + plot_size;
+
+(mouse_cap & 1) && in_box ? (
+  idx = floor((mouse_x - plot_x)/plot_size*(ws_size-1));
+  idx = max(0, min(ws_size-1, idx));
+  val = 1 - ((mouse_y - plot_y)/plot_size)*2;
+  val = max(-1, min(1, val));
+  drawing ? (
+    n = abs(idx - draw_lastidx);
+    n > 0 ? (
+      k = 0;
+      while (k <= n) (
+        t = k/n;
+        ii = floor(draw_lastidx + (idx - draw_lastidx)*t + 0.5);
+        ii = max(0, min(ws_size-1, ii));
+        ws_table[ii] = draw_lastval + (val - draw_lastval)*t;
+        k += 1;
+      );
+    ) : (
+      ws_table[idx] = val;
+    );
+  ) : (
+    ws_table[idx] = val;
+    drawing = 1;
+  );
+  draw_lastidx = idx;
+  draw_lastval = val;
+) : (
+  drawing = 0;
+);
+
+(mouse_cap & 2) && in_box && !right_down_prev ? (
+  i = 0;
+  while (i < ws_size) ( ws_table[i] = (i/(ws_size-1))*2 - 1; i += 1; );
+);
+right_down_prev = mouse_cap & 2;
+
+gfx_set(0.65, 0.65, 0.7, 1);
+gfx_x = plot_x;
+gfx_y = plot_y + plot_size + 8;
+gfx_drawstr("Drag to draw the curve. Right-click: reset to linear.");
+
+sprintf(#status, "FB1 %.2f  FB2 %.2f  Mix %.2f  Drive %.1fdB  Out %.1fdB  OS:%d", fb1_target, fb2_target, mix_target, drive_db, outlevel_db, oversample_on);
+gfx_x = plot_x;
+gfx_y = plot_y + plot_size + 24;
+gfx_drawstr(#status);

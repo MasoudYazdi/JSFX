@@ -1,0 +1,237 @@
+desc:CG Ecosystem - self-regulating feedback ecology (Di Scipio-style): cells that feed, regulate, prey on and adapt to each other and to your guitar
+tags:musique-concrete ecosystemic feedback generative live
+slider1:4<2,6,1>Cells
+slider2:60<5,400,1:log>Delay Base (ms)
+slider3:0.5<0,1,0.001>Coupling
+slider4:0.5<0,1,0.001>Self-Feedback
+slider5:-24<-50,-6,0.1>Homeostasis Target Level (dB)
+slider6:1<0.05,5,0.01:log>Regulation Speed
+slider7:0.3<0,1,0.001>Predation (neighbours suppress each other)
+slider8:0.4<0,1,0.001>Adaptation (cells tune to the sound)
+slider9:0.3<0,1,0.001>Mutation
+slider10:0.8<0,2,0.001>Guitar Sensitivity
+slider11:-70<-90,-40,0.1>Spontaneous Activity (dB, -90 = none)
+slider12:8<1,30,0.1>Resonance (Q)
+slider13:0<-24,12,0.1>Output (dB)
+slider14:0.7<0,1,0.01>Stereo Width
+slider15:-3<-60,6,0.1>Wet (dB)
+slider16:0<-60,6,0.1>Dry (dB)
+slider17:0<0,3,1{Auto,L,R,L+R}>Input
+slider18:1<1,4,1>Analysis Bus (1-4)
+slider19:0<0,10,1{None,Level,Onset,Brightness,Noisiness,Flux,Pitch,Mod 1,Mod 2,Mod 3,Mod 4}>Mod Source
+slider20:0<-0.5,0.5,0.01>Mod -> Coupling
+slider21:0<-12,12,0.1>Mod -> Target Level (dB)
+slider22:0<0,1,1{-,RESET ECOLOGY}>Reset / Panic
+
+in_pin:Input L
+in_pin:Input R
+out_pin:Output L
+out_pin:Output R
+options:gmem=CGbus no_meter
+
+@init
+
+ext_noinit=1;
+PI=3.141592653589793; TWOPI=6.283185307179586; CEIL=2;
+
+// ---- NaN-safe primitives. Comparisons with NaN are false, so every function below maps NaN/inf to a finite value ----
+function lim(x,lo,hi) ( x>=lo ? (x<=hi ? x : hi) : lo );
+function fin(x) ( abs(x)<100000 ? x : 0 );
+function db2lin(d) ( exp(lim(d,-120,60)*0.11512925464970229) );
+function dbgain(d) ( d<=-59.9 ? 0 : db2lin(d) );
+function lin2db(x) ( 8.685889638065035*log(abs(x)+0.000000001) );
+function sat(x) ( abs(x)<3 ? x*(27+x*x)/(27+9*x*x) : (x>0 ? 1 : -1) );
+function sclip(x,c) local(ax,k,y) ( ax=abs(x); k=c*0.7; y=ax<k ? ax : k+(c-k)*sat((ax-k)/(c-k)); x<0 ? -y : y );
+function mixf(a,b,t) ( a+(b-a)*t );
+function lpc(fc) ( 1-exp(-TWOPI*lim(fc,1,srate*0.45)/srate) );
+function smooth01(t) ( t<=0 ? 0 : (t>=1 ? 1 : t*t*(3-2*t)) );
+function rnd() ( rng=rng*1664525+1013904223; rng-=floor(rng/4294967296)*4294967296; rng/4294967296 );
+function rnds() ( rnd()*2-1 );
+function alloc(sz) local(p) ( p=mp; mp+=sz; memset(p,0,sz); p );
+
+// ---- mono input pick (guitar usually lives on one channel) + DC block ----
+function pick_in() local(yy) (
+  eL+=(inL*inL-eL)*0.0005; eR+=(inR*inR-eR)*0.0005;
+  imode<0.5 ? ( xm = eR<0.0005*eL ? inL : (eL<0.0005*eR ? inR : (inL+inR)*0.5) )
+  : ( imode<1.5 ? ( xm=inL ) : ( imode<2.5 ? ( xm=inR ) : ( xm=(inL+inR)*0.5 ) ) );
+  yy=xm-dcx+dcr*dcy; dcx=xm; dcy=yy; xm=fin(yy);
+);
+
+// ---- onset detector (fast/slow envelope ratio with refractory time) ----
+function ons_proc(x) local(a) (
+  a=abs(x);
+  ons_f+=(a-ons_f)*(a>ons_f ? ons_kfa : ons_kfr);
+  ons_s+=(a-ons_s)*(a>ons_s ? ons_ksa : ons_ksr);
+  ons_ev=0;
+  ons_cool>0 ? ons_cool-=1;
+  (ons_cool<=0 && ons_f>ons_thr && ons_f>ons_s*ons_ratio) ? ( ons_ev=1; ons_cool=ons_refr; ons_cnt+=1; );
+);
+
+// ---- analysis bus (written by CG_Analyzer, optional for every other module) ----
+function bus_update() (
+  bus_b=(lim(floor(bus_sel+0.5),1,4)-1)*16;
+  hb=gmem[bus_b];
+  abs(hb-hb_last)>0.5 ? ( hb_last=hb; bus_stale=0; ) : ( bus_stale+=samplesblock; );
+  bus_alive=bus_stale<srate*0.4;
+  mb=gmem[bus_b+15];
+  abs(mb-mb_last)>0.5 ? ( mb_last=mb; mbus_stale=0; ) : ( mbus_stale+=samplesblock; );
+  mbus_alive=mbus_stale<srate*0.4;
+);
+// sel 1..6 = Analyzer streams, 7..10 = Modulator lanes 1..4 (bus slots 11..14). Everything is clamped 0..1.
+function bus_get(sel) local(s) ( s=floor(sel+0.5); s<0.5 ? 0 : ( s<=6.5 ? (bus_alive ? lim(gmem[bus_b+s],0,1) : 0) : (mbus_alive ? lim(gmem[bus_b+s+4],0,1) : 0) ) );
+function bus_onset() local(c,r) ( r=0; bus_alive ? ( c=gmem[bus_b+10]; abs(c-bus_cnt_last)>0.5 ? ( r=1; bus_cnt_last=c; ); ); r );
+mp=0;
+
+NC=6;
+DLM=floor(srate*1.7)+16;
+dbuf=alloc(NC*DLM);
+st=alloc(NC*2); gc=alloc(NC); en=alloc(NC); yc=alloc(NC); fcu=alloc(NC); fct=alloc(NC); Tc=alloc(NC); Ttc=alloc(NC);
+cen=alloc(NC); fk=alloc(NC); mut_f=alloc(NC); mut_t=alloc(NC); mtm=alloc(NC); plc=alloc(NC); prc=alloc(NC); rat=alloc(NC);
+rat[0]=1; rat[1]=1.5; rat[2]=2; rat[3]=2.5; rat[4]=3; rat[5]=4;
+rng=2468;
+wp=0; ncell=4; base_T=0.06*srate; tgt_db=-24; reg=1; pred=0.3; adapt=0.4; mutr=0.3; spont=0; qq=0.125;
+md_cpl=0; md_tgt=0; zcr_s=0; zprev=0; ctl=0; Lg=0; dn=0.000000000000001; width=0.7;
+k_e=1-exp(-1/(0.02*srate)); k_T=1-exp(-1/(0.15*srate)); k_z=1-exp(-1/(0.06*srate)); dt_t=64/srate;
+FMAXC=min(8000,srate/8);
+
+function init_cells() local(i,ang) (
+  i=0;
+  while(i<NC) (
+    gc[i]=1.0; en[i]=0; yc[i]=0; fcu[i]=180*pow(2,i*0.55); fct[i]=fcu[i]; Tc[i]=base_T*(1+0.37*i); Ttc[i]=Tc[i];
+    mut_f[i]=0; mut_t[i]=0; mtm[i]=floor(srate*(0.4+0.3*i));
+    ang=((i/5)*2-1)*width*(i&1 ? 1 : -1); ang=(ang*0.5+0.5)*1.5707963267948966; plc[i]=cos(ang); prc[i]=sin(ang);
+    i+=1;
+  );
+);
+init_cells();
+function do_clear() ( memset(dbuf,0,NC*DLM); memset(st,0,NC*2); memset(en,0,NC); memset(yc,0,NC); init_cells(); zcr_s=0; Lg=0; );
+function svf(o,f,q,x) local(lo,hi,bd) (
+  lo=o[0]+f*o[1];
+  hi=x-lo-q*o[1];
+  bd=o[1]+f*hi;
+  o[0]=lo; o[1]=lim(bd,-60,60);
+  bd*q
+);
+function eco_tick() local(i,n,p,en_,ep_,nb,err,tl,zf,goal,fb_,tn) (
+  tl=db2lin(lim(tgt_db+md_tgt*mod_s*12,-60,0));
+  Lg=0; i=0; while(i<ncell) ( Lg+=en[i]; i+=1; ); Lg/=max(ncell,1);
+  err=lim((tl-Lg)/(tl+0.0001),-1,1);
+  zf=lim(zcr_s*srate*0.5,60,3000);
+  i=0;
+  while(i<NC) (
+    n=i+1>=ncell ? 0 : i+1; p=i==0 ? ncell-1 : i-1;
+    en_=en[n]; ep_=en[p]; nb=(en_+ep_)*0.5;
+    // homeostasis (growth/decay of loop gain) and predation by stronger neighbours
+    gc[i]=lim(gc[i]+dt_t*(reg*err*1.0-pred*1.5*reg*max(0,nb-en[i])/(nb+en[i]+0.0001)),0.2,3.5);
+    // mutation events
+    mtm[i]-=64;
+    mtm[i]<=0 ? ( mtm[i]=floor(srate*(0.4+1.6*rnd())); mut_f[i]=rnds()*mutr; mut_t[i]=rnds()*mutr; );
+    // adaptation: cell centre frequency pulled toward harmonics of the sound's dominant frequency
+    goal=zf*rat[i];
+    fb_=180*pow(2,i*0.55);
+    fct[i]=lim(mixf(fb_,goal,adapt)*pow(2,mut_f[i]),60,FMAXC);
+    fcu[i]+=(fct[i]-fcu[i])*0.03;
+    fk[i]=2*sin(3.141592653589793*lim(fcu[i],60,FMAXC)/srate);
+    // delay time: base pattern, mutated, bent by neighbour energy contrast
+    tn=base_T*(1+0.37*i)*pow(2,mut_t[i]*0.5)*(1+0.25*adapt*(en_-ep_)/(en_+ep_+0.0001));
+    Ttc[i]=lim(tn,0.003*srate,DLM-8);
+    i+=1;
+  );
+);
+
+function read_params() (
+
+bus_sel=slider18; imode=slider17; msel=slider19;
+T_wet=dbgain(slider15); T_dry=dbgain(slider16);
+md_cpl=lim(slider20,-0.5,0.5); md_tgt=lim(slider21,-12,12); mod_t=bus_get(msel);
+T_cpl=lim(lim(slider3,0,1)+md_cpl*mod_s,0,1.2); T_self=lim(slider4,0,1);
+T_out=db2lin(lim(slider13,-24,12)); T_sens=lim(slider10,0,2);
+ncell=lim(floor(slider1+0.5),2,6); base_T=lim(slider2,5,400)*0.001*srate;
+tgt_db=lim(slider5,-50,-6); reg=lim(slider6,0.05,5); pred=lim(slider7,0,1); adapt=lim(slider8,0,1); mutr=lim(slider9,0,1);
+spont=slider11<=-89 ? 0 : db2lin(lim(slider11,-90,-40)); qq=1/lim(slider12,1,30); width=lim(slider14,0,1);
+
+);
+function copy_params() ( P_wet=T_wet; P_dry=T_dry; P_cpl=T_cpl; P_self=T_self; P_out=T_out; P_sens=T_sens; );
+
+// ---- panic machine: fade wet out, clear every buffer, fade back in. Triggered by button or by internal watchdog ----
+function panic_step() (
+  (panic_req>0.5 && pan_ph==0) ? ( pan_ph=1; );
+  panic_req=0;
+  pan_ph==1 ? ( pan_g-=pan_dn; pan_g<=0 ? ( pan_g=0; do_clear(); pan_ph=2; pan_hold=floor(0.03*srate); ); );
+  pan_ph==2 ? ( pan_hold-=1; pan_hold<=0 ? ( pan_ph=3; ); );
+  pan_ph==3 ? ( pan_g+=pan_up; pan_g>=1 ? ( pan_g=1; pan_ph=0; ); );
+  pan_gs=pan_g*pan_g*(3-2*pan_g);
+);
+
+// ---- final stage: wet DC block, dry/wet sum, finite scrub, soft ceiling at +6 dB ----
+function finish() local(yy) (
+  wL=fin(wL); wR=fin(wR);
+  yy=wL-wxL+dcr*wyL; wxL=wL; wyL=yy; wL=yy;
+  yy=wR-wxR+dcr*wyR; wxR=wR; wyR=yy; wR=yy;
+  oL=sclip(fin(inL*P_dry+wL*P_wet*pan_gs),CEIL);
+  oR=sclip(fin(inR*P_dry+wR*P_wet*pan_gs),CEIL);
+  spl0=oL; spl1=oR;
+);
+
+smc=1-exp(-1/(0.015*srate));
+kmod=1-exp(-1/(0.004*srate));
+dcr=1-TWOPI*10/srate;
+pan_dn=1/(0.01*srate); pan_up=1/(0.05*srate); pan_g=1; pan_gs=1; pan_ph=0; panic_req=0;
+ons_kfa=1-exp(-1/(0.001*srate)); ons_kfr=1-exp(-1/(0.025*srate));
+ons_ksa=1-exp(-1/(0.040*srate)); ons_ksr=1-exp(-1/(0.250*srate));
+ons_ratio=2.2; ons_thr=db2lin(-52); ons_refr=floor(0.07*srate);
+bus_sel=1; imode=0; pfirst=1;
+rng=7022;
+
+@block
+
+bus_update();
+pan_btn=slider22; (pan_btn>0.5 && pan_prev<0.5) ? ( panic_req=1; ); pan_prev=pan_btn;
+read_params();
+pfirst ? ( copy_params(); pfirst=0; );
+
+
+@sample
+
+inL=fin(spl0); inR=fin(spl1);
+pick_in();
+ons_proc(xm);
+panic_step();
+mod_s+=(mod_t-mod_s)*kmod;
+P_wet+=(T_wet-P_wet)*smc;
+P_dry+=(T_dry-P_dry)*smc;
+P_cpl+=(T_cpl-P_cpl)*smc;
+P_self+=(T_self-P_self)*smc;
+P_out+=(T_out-P_out)*smc;
+P_sens+=(T_sens-P_sens)*smc;
+
+dn=-dn;
+(ctl+=1)>=64 ? ( ctl=0; eco_tick(); );
+noise=spont>0 ? rnds()*spont : 0;
+sL=0; sR=0; i=0;
+while(i<NC) (
+  cen[i]+=(lim(ncell-i,0,1)-cen[i])*smc;
+  n=i+1>=ncell ? 0 : i+1; p=i==0 ? ncell-1 : i-1;
+  inj=xm*P_sens+noise+gc[i]*(P_cpl*(0.6*yc[n]+0.4*yc[p])+P_self*yc[i]);
+  Tc[i]+=(Ttc[i]-Tc[i])*k_T; Tc[i]=lim(Tc[i],16,DLM-8);
+  base=dbuf+i*DLM;
+  rp=wp-Tc[i]; rp<0 ? (rp+=DLM);
+  i0=floor(rp); fr=rp-i0; i1=i0+1; i1>=DLM ? (i1=0); i0>=DLM ? (i0=DLM-1); i0<0 ? (i0=0);
+  d=base[i0]*(1-fr)+base[i1]*fr;
+  base[wp]=sat(inj*cen[i])+dn;
+  y=svf(st+i*2,fk[i],qq,d)*cen[i];
+  yc[i]=lim(fin(y),-2,2);
+  en[i]+=(abs(yc[i])-en[i])*k_e;
+  sL+=yc[i]*plc[i]; sR+=yc[i]*prc[i];
+  abs(st[i*2])<50 ? 0 : ( panic_req=1; );
+  i+=1;
+);
+wp+=1; wp>=DLM ? (wp=0);
+os=(sL+sR)*0.5;
+zc=0; abs(os)>0.002 ? ( ((os>0)!=(zprev>0)) ? ( zc=1; ); zprev=os; );
+zcr_s+=(zc-zcr_s)*k_z;
+g=P_out*1.4/sqrt(max(ncell,1));
+wL=sL*g; wR=sR*g;
+(abs(wL)<20 && abs(wR)<20) ? 0 : ( panic_req=1; wL=0; wR=0; );
+finish();
+

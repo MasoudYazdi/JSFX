@@ -1,0 +1,909 @@
+desc:Sample Phase Lab - sample-accurate loop displacement / tempo phasing / decorrelation
+author:Mass
+version:1.0
+tags:phasing looper decorrelation spatial minimalism reich vaggione
+about:Sample Phase Lab
+  Port and extension of the Sample Phase Lab web prototype.
+  Six process modes (Vaggione decorrelation, Sample Phase, Piano Phase continuous and stepped,
+  Fixed phase, Phase cloud), 2-12 voices, sample-accurate integer loop displacement,
+  host-tempo phasing, live loop capture or audio-file source.
+  Offsets, thresholds and trajectories follow H. Vaggione, "Composing Musical Spaces by Means of
+  Decorrelation of Audio Signals" (DAFX-01 Addendum).
+
+in_pin:Left
+in_pin:Right
+out_pin:Left
+out_pin:Right
+
+slider1:p_src=0<0,1,1{Live capture,Audio file}>Source
+slider2:/phase_lab:none:Audio file (REAPER Data/phase_lab)
+slider3:p_capTrig=0<0,1,1{Idle,CAPTURE}>Capture trigger (auto-resets)
+slider4:p_capQuant=0<0,2,1{Immediate,Next beat,Next bar}>Capture start
+slider5:p_lenMode=1<0,2,1{Free (ms),Tempo (beats),Whole source (file)}>Loop length mode
+slider6:p_loopStart=0<0,20000,0.1>Loop start (ms, file)
+slider7:p_loopMs=1000<20,20000,1>Loop length (ms)
+slider8:p_loopBeats=6<0,11,1{1/4 beat,1/2 beat,1 beat,1.5 beats,2 beats,3 beats,4 beats,6 beats,8 beats,12 beats,16 beats,32 beats}>Loop length (beats)
+slider9:p_tempoFollow=0<0,1,1{Off,On (varispeed)}>Follow host tempo
+slider10:p_fileComp=1<0,1,1{Native rate,Pitch-correct}>File sample-rate handling
+slider11:p_seamMs=5<0,50,0.5>Loop seam crossfade (ms)
+slider12:p_srcCh=0<0,1,1{Stereo (balance pan),Mono sum (equal-power pan)}>Source channels
+slider13:p_mode=0<0,5,1{Vaggione - multi-local decorrelation,Sample Phase - sample advance per loop,Piano Phase - continuous tempo difference,Piano Phase - stepped acceleration,Fixed phase - constant displacement,Phase cloud - offset and drifting voices}>Process
+slider14:p_nVoices=2<2,12,1>Voices
+slider15:p_restart=1<0,1,1{Free-run,Restart on play / seek}>Transport
+slider16:p_spShift=1<-5000,5000,1>Sample shift per repetition
+slider17:p_spInit=0<0,200000,1>Initial offset (samples)
+slider18:p_spMult=1<1,100,1>Voice shift multiplier
+slider19:p_pnUnit=0<0,1,1{ppm,BPM offset}>Tempo difference unit
+slider20:p_pnPpm=100<0,50000,1>Difference per voice (ppm)
+slider21:p_pnBpm=0.05<0,10,0.001>Difference per voice (BPM)
+slider22:p_pnRamp=30<0.1,3600,0.1>Acceleration time (s)
+slider23:p_pnDir=0<0,1,1{Advance (faster),Retard (slower)}>Direction
+slider24:p_stTarget=0.3<0.001,20,0.001>Final tempo difference (%)
+slider25:p_stDur=45<1,3600,1>Ramp duration (s)
+slider26:p_stHold=30<0,3600,1>Hold after ramp (s)
+slider27:p_stRet=0<0,1,1{Keep drifting,Return to unison}>After hold
+slider28:p_fxOff=1000<0,200000,1>Fixed offset (samples)
+slider29:p_fxSpread=1000<0,200000,1>Offset spread per voice (samples)
+slider30:p_clDrift=35<-5000,5000,1>Drift per voice (ppm)
+slider31:p_clSpread=12000<0,200000,1>Initial offset spread (samples)
+slider32:p_clRand=0<0,1,1{Even spacing,Random}>Initial offsets
+slider33:p_clSeed=17<0,9999,1>Random seed
+slider34:p_vgPreset=3<0,4,1{Custom,1 ms micro-offset,3 ms short-grain space,31 ms Agon example,48 ms directional movement}>Vaggione study presets
+slider35:p_vgMin=0<0,2000,0.01>Minimum offset (ms)
+slider36:p_vgMax=31<0,2000,0.01>Maximum offset (ms)
+slider37:p_vgCurve=3<0,5,1{Linear ramp,Smoothstep,Periodic sine,Multi-scale / multi-local,Bounded random walk,Logistic attractor}>Offset trajectory
+slider38:p_vgDur=24<0.1,3600,0.1>Trajectory duration (s)
+slider39:p_vgSpread=3<0,500,0.01>Offset spread per voice (ms)
+slider40:p_vgTScale=1.7<0.05,20,0.01>Time-scale ratio per voice
+slider41:p_vgDepth=3<2,4,1>Multi-scale layers
+slider42:p_vgSeed=37<0,9999,1>Attractor / random seed
+slider43:p_vgUnit=0<0,2,1{Every loop,Every half-loop,Every quarter-loop}>Offset update unit
+slider44:p_route=0<0,2,1{Spread voices across stereo,Alternate left / right,Center all voices}>Spatial routing
+slider45:p_width=0.85<0,1,0.01>Stereo width
+slider46:p_xfMs=1<0,20,0.1>Displacement crossfade (ms, 0 = hard)
+slider47:p_guard=0<0,1,1{Off,On}>Phase guard
+slider48:p_guardThr=0.35<0,1,0.01>Guard threshold (negative correlation)
+slider49:p_guardStep=8<1,64,1>Guard nudge (samples)
+slider50:p_mix=100<0,100,1>Wet (%)
+slider51:p_level=0<-24,6,0.1>Output (dB)
+slider52:p_monoOut=0<0,1,1{Stereo,Mono sum (comb test)}>Output
+
+@init
+ext_noinit = 1;
+MAXV = 12;
+TBL = 16384;
+OVN = 512;
+PI2 = $pi*0.5;
+
+cap = min(floor(srate*20), 3600000);
+bufL = 0;
+bufR = cap + 16;
+mp = 2*(cap + 16);
+tmpF = mp; mp += 16384;
+tabW = mp; mp += TBL;
+tabG = mp; mp += TBL;
+vPhi = mp; mp += 16;
+vRel = mp; mp += 16;
+vD0 = mp; mp += 16;
+vD1 = mp; mp += 16;
+vXf = mp; mp += 16;
+vGL = mp; mp += 16;
+vGR = mp; mp += 16;
+vTL = mp; mp += 16;
+vTR = mp; mp += 16;
+vTrim = mp; mp += 16;
+vPos = mp; mp += 16;
+vOld = mp; mp += 16;
+ovMin = mp; mp += OVN;
+ovMax = mp; mp += OVN;
+beatTab = mp; mp += 16;
+memset(0, 0, mp);
+
+beatTab[0] = 0.25; beatTab[1] = 0.5; beatTab[2] = 1; beatTab[3] = 1.5;
+beatTab[4] = 2; beatTab[5] = 3; beatTab[6] = 4; beatTab[7] = 6;
+beatTab[8] = 8; beatTab[9] = 12; beatTab[10] = 16; beatTab[11] = 32;
+
+loopValid = 0; LA = 0; LL = 1024; SX = 0; baseRate = 1; refTempo = 120;
+rm = 1; rmT = 1; hostRate = 1;
+engGain = 0; engTarget = 0; engStep = 0.002;
+capState = 0; capPos = 0; capLen = 0; capSX = 0; capTotal = 0; capTempo = 120;
+capStartSample = -1; capReq = 0; blkPos = 0;
+cycleIdx = 0; cycLen = 1024; tProc = 0; stepped = 1; nV = 2; md = 0;
+curveI = 3; depthI = 3; srcCh = 0; xfN = 0; xfInc = 1; guardRR = 0; vNorm = 0.7;
+wasPlay = 0; expBeat = 0; latchPending = 0; procPending = 0;
+fileOK = 0; fileFrames = 0; fileRate = srate; fch = 2; fsr = srate;
+cLR = 0; cLL = 0; cRR = 0; corrV = 0;
+wetS = 0; dryS = 1; lvlS = 1; wetT = 1; dryT0 = 0; lvlT = 1;
+o_src = -1; o_file = -1; o_lenMode = -1; o_loopStart = -1; o_loopMs = -1; o_loopBeats = -1;
+o_fileComp = -1; o_seamMs = -1; o_mode = -1; o_nV = -1; o_clSeed = -1; o_clRand = -1;
+o_clSpread = -1; o_vgSeed = -1; o_vgUnit = -1; o_xf = -1;
+lastPreset = -1; lastMax = -1;
+lcgS = 1;
+pCoef = 0.002; panCoef = 0.001; corrCoef = 0.0001;
+prevMouse = 0;
+
+// ------------------------------------------------------------------ utilities
+function sane(x) (
+  (x > -100000 && x < 100000) ? x : 0;
+);
+
+// soft knee saturation: transparent below 0.7, asymptotic to 1.0 (never a hard limit)
+function softclip(x) local(a, t, y) (
+  a = abs(x);
+  a < 0.7 ? x : (
+    t = (a - 0.7)*3.3333333;
+    y = t < 3 ? t*(27 + t*t)/(27 + 9*t*t) : 1;
+    (0.7 + 0.3*y)*(x < 0 ? -1 : 1);
+  );
+);
+
+// custom LCG (EEL2 has no srand)
+function lcgNext() global(lcgS) (
+  lcgS = lcgS*1664525 + 1013904223;
+  lcgS = lcgS - floor(lcgS/4294967296)*4294967296;
+  lcgS/4294967296;
+);
+
+function buildTables(seed) local(i, w, g) global(TBL, lcgS, tabG, tabW) (
+  lcgS = (seed % 100000)*7919 + 12345;
+  lcgNext();
+  w = 0.5;
+  i = 0;
+  loop(TBL,
+    w = min(max(w + (lcgNext() - 0.5)*0.18, 0), 1);
+    tabW[i] = w;
+    i += 1;
+  );
+  g = 0.217 + (seed % 97)*0.0013;
+  i = 0;
+  loop(TBL,
+    g = 3.91*g*(1 - g);
+    tabG[i] = g;
+    i += 1;
+  );
+);
+
+function maskRange(a, b) local(m, i) (
+  m = 0;
+  i = a;
+  loop(b - a + 1,
+    m += pow(2, i - 1);
+    i += 1;
+  );
+  m;
+);
+
+// ------------------------------------------------------------------ loop reader
+// reads both channels at loop-relative position pos in [0, LL) into oL/oR.
+// 4-point Hermite, integer fast path, cyclic wrap, equal-power seam crossfade.
+function rdv(pos) local(i0, fr, im, i1, i2, a, b, c, d, w, tj, tL, tR, gA, gB, ib) global(LA, LL, PI2, SX, bufL, bufR, oL, oR, srcCh) (
+  i0 = floor(pos);
+  fr = pos - i0;
+  i0 < 0 ? i0 = 0;
+  i0 > LL - 1 ? i0 = LL - 1;
+  im = i0 > 0 ? i0 - 1 : LL - 1;
+  i1 = i0 + 1 < LL ? i0 + 1 : 0;
+  i2 = i1 + 1 < LL ? i1 + 1 : 0;
+  im += LA; ib = i0 + LA; i1 += LA; i2 += LA;
+  fr < 0.000001 ? (
+    oL = bufL[ib];
+    oR = bufR[ib];
+  ) : (
+    a = bufL[im]; b = bufL[ib]; c = bufL[i1]; d = bufL[i2];
+    oL = b + 0.5*fr*(c - a + fr*(2*a - 5*b + 4*c - d + fr*(3*(b - c) + d - a)));
+    a = bufR[im]; b = bufR[ib]; c = bufR[i1]; d = bufR[i2];
+    oR = b + 0.5*fr*(c - a + fr*(2*a - 5*b + 4*c - d + fr*(3*(b - c) + d - a)));
+  );
+  (SX > 0 && i0 < SX) ? (
+    w = (i0 + fr)/SX;
+    tj = LA + LL + i0;
+    fr < 0.000001 ? (
+      tL = bufL[tj];
+      tR = bufR[tj];
+    ) : (
+      a = bufL[tj - 1]; b = bufL[tj]; c = bufL[tj + 1]; d = bufL[tj + 2];
+      tL = b + 0.5*fr*(c - a + fr*(2*a - 5*b + 4*c - d + fr*(3*(b - c) + d - a)));
+      a = bufR[tj - 1]; b = bufR[tj]; c = bufR[tj + 1]; d = bufR[tj + 2];
+      tR = b + 0.5*fr*(c - a + fr*(2*a - 5*b + 4*c - d + fr*(3*(b - c) + d - a)));
+    );
+    gA = sin(w*PI2);
+    gB = cos(w*PI2);
+    oL = oL*gA + tL*gB;
+    oR = oR*gA + tR*gB;
+  );
+  srcCh == 1 ? (
+    oL = (oL + oR)*0.5;
+    oR = oL;
+  );
+);
+
+// ------------------------------------------------------------------ Vaggione trajectories
+// returns the offset in milliseconds of voice v for update step k
+function vagValue(v, k) local(cd, lt, ph, val, kk, w, pp, sum, wsum, idx, ms, mx) global(TBL, baseRate, curveI, cycLen, depthI, nV, p_vgDur, p_vgMax, p_vgMin, p_vgSpread, p_vgTScale, srate, tabG, tabW) (
+  cd = cycLen/(baseRate*srate);
+  lt = min(k*cd*pow(p_vgTScale, v), 1000000000000);
+  ph = (lt - floor(lt/p_vgDur)*p_vgDur)/p_vgDur;
+  val = 0.5;
+  curveI == 0 ? ( val = ph; ) :
+  curveI == 1 ? ( val = ph*ph*(3 - 2*ph); ) :
+  curveI == 2 ? ( val = 0.5 + 0.5*sin(2*$pi*ph + v*0.71); ) :
+  curveI == 4 ? ( idx = (k*(v + 1) + v*97) % TBL; val = tabW[idx]; ) :
+  curveI == 5 ? ( idx = (k*(v + 1) + v*131) % TBL; val = tabG[idx]; ) : (
+    sum = 0; wsum = 0; kk = 0;
+    loop(depthI,
+      w = kk == 0 ? 0.5 : (kk == 1 ? 0.25 : (kk == 2 ? 0.15 : 0.1));
+      pp = kk == 0 ? 1 : (kk == 1 ? 4 : (kk == 2 ? 16 : 64));
+      sum += w*(0.5 + 0.5*sin(2*$pi*lt*pp/p_vgDur + v*0.37*(kk + 1)));
+      wsum += w;
+      kk += 1;
+    );
+    val = sum/wsum;
+  );
+  mx = max(p_vgMax, p_vgMin);
+  ms = p_vgMin + (mx - p_vgMin)*val + v*p_vgSpread;
+  min(max(ms, 0), mx + nV*p_vgSpread);
+);
+
+// ------------------------------------------------------------------ displacement targets
+// computes the integer displacement of every voice for update step cycleIdx.
+// initial=1: take values at once; otherwise crossfade from the continuing previous head.
+function retarget(initial) local(v, k, dn, tr, gv) global(LL, baseRate, corrV, cycLen, cycleIdx, guardRR, md, nV, p_fxOff, p_fxSpread, p_guard, p_guardStep, p_guardThr, p_spInit, p_spMult, p_spShift, srate, stepped, vD0, vD1, vTrim, vXf, xfN) (
+  k = cycleIdx;
+  (initial == 0 && p_guard > 0.5 && nV >= 2 && stepped && corrV < -p_guardThr) ? (
+    guardRR += 1;
+    gv = 1 + (guardRR % (nV - 1));
+    vTrim[gv] = (vTrim[gv] + p_guardStep) % (p_guardStep*16);
+  );
+  v = 0;
+  loop(nV,
+    dn = 0;
+    md == 0 ? ( dn = floor(vagValue(v, k)*0.001*srate*baseRate + 0.5); ) :
+    md == 1 ? ( dn = p_spInit + k*p_spShift*p_spMult*v; ) :
+    md == 4 ? ( dn = p_fxOff + v*p_fxSpread; );
+    stepped ? ( dn += vTrim[v]; );
+    dn = dn - floor(dn/LL)*LL;
+    initial ? (
+      vD0[v] = dn; vD1[v] = dn; vXf[v] = 1;
+    ) : (
+      // previous head keeps reading phi_old + d_old = phi_new + (d_old + cycLen)
+      tr = dn - vD0[v] - cycLen;
+      tr = tr - floor(tr/LL)*LL;
+      (xfN < 1 || tr < 0.5 || tr > LL - 0.5) ? (
+        vD0[v] = dn; vD1[v] = dn; vXf[v] = 1;
+      ) : (
+        vD1[v] = vD0[v] + cycLen;
+        vD0[v] = dn;
+        vXf[v] = 0;
+      );
+    );
+    v += 1;
+  );
+);
+
+// restart the whole process. smooth=1 crossfades from the previous read positions.
+function resetProcess(smooth, startPh) local(v, grain, off, tr) global(LL, MAXV, cycLen, cycleIdx, guardRR, lcgS, md, nV, p_clRand, p_clSeed, p_clSpread, p_nVoices, p_vgUnit, p_xfMs, rm, rmT, srate, stepped, tProc, vD0, vD1, vOld, vPhi, vRel, vTrim, vXf, xfInc, xfN) (
+  nV = max(2, min(MAXV, floor(p_nVoices + 0.5)));
+  grain = 1;
+  md == 0 ? ( grain = p_vgUnit > 1.5 ? 0.25 : (p_vgUnit > 0.5 ? 0.5 : 1); );
+  cycLen = max(16, floor(LL*grain + 0.5));
+  xfN = floor(p_xfMs*0.001*srate + 0.5);
+  xfN = min(xfN, floor(cycLen/max(rmT, 0.25)*0.4));
+  xfInc = xfN > 0 ? 1/xfN : 1;
+  v = 0;
+  loop(MAXV,
+    vOld[v] = smooth ? vPhi[v] + vD0[v] : 0;
+    v += 1;
+  );
+  lcgS = (p_clSeed % 100000)*7919 + 17;
+  lcgNext();
+  v = 0;
+  loop(MAXV,
+    off = 0;
+    md == 5 ? (
+      p_clRand > 0.5 ? ( off = floor(lcgNext()*LL); ) : ( off = floor(v*p_clSpread/max(1, nV - 1)); );
+    );
+    off += startPh;
+    off = off - floor(off/LL)*LL;
+    vPhi[v] = off;
+    vRel[v] = 1;
+    vTrim[v] = 0;
+    vD0[v] = 0; vD1[v] = 0; vXf[v] = 1;
+    v += 1;
+  );
+  stepped ? (
+    // stepped modes share one clock: all voices start at the same phase
+    v = 0;
+    loop(MAXV, vPhi[v] = startPh; v += 1;);
+  );
+  cycleIdx = 0; tProc = 0; guardRR = 0;
+  rm = rmT;
+  retarget(1);
+  smooth ? (
+    v = 0;
+    loop(nV,
+      tr = (vD0[v] + vPhi[v]) - vOld[v];
+      tr = tr - floor(tr/LL)*LL;
+      (xfN > 0 && tr > 0.5 && tr < LL - 0.5) ? (
+        vD1[v] = vOld[v] - vPhi[v];
+        vXf[v] = 0;
+      );
+      v += 1;
+    );
+  );
+);
+
+// ------------------------------------------------------------------ loop definition
+function latchLoop() local(tp, startB, lenB, x, avail) global(LA, LL, SX, baseRate, beatTab, capLen, capSX, capTempo, fileFrames, fileOK, fileRate, loopValid, p_fileComp, p_lenMode, p_loopBeats, p_loopMs, p_loopStart, p_seamMs, p_src, refTempo, rm, rmT, srate, tempo) (
+  tp = tempo > 20 ? tempo : 120;
+  loopValid = 0;
+  floor(p_src + 0.5) == 0 ? (
+    baseRate = 1;
+    capLen >= 64 ? (
+      LA = 0; LL = capLen; SX = capSX; refTempo = capTempo; loopValid = 1;
+    );
+  ) : (
+    fileOK ? (
+      baseRate = p_fileComp > 0.5 ? fileRate/srate : 1;
+      refTempo = tp;
+      startB = floor(p_loopStart*0.001*srate*baseRate + 0.5);
+      startB = min(max(startB, 0), fileFrames - 64);
+      lenB = floor(p_loopMs*0.001*srate*baseRate + 0.5);
+      p_lenMode > 1.5 ? ( lenB = fileFrames - startB; ) :
+      p_lenMode > 0.5 ? ( lenB = floor(beatTab[floor(p_loopBeats + 0.5)]*60/tp*srate*baseRate + 0.5); );
+      lenB = min(max(lenB, 64), fileFrames - startB);
+      x = floor(p_seamMs*0.001*srate*baseRate + 0.5);
+      x = min(x, floor(lenB*0.25));
+      avail = fileFrames - startB - lenB - 4;
+      x = min(x, avail);
+      x < 2 ? x = 0;
+      LA = startB; LL = lenB; SX = x; loopValid = 1;
+    );
+  );
+  rmT = min(max(baseRate, 0.05), 4);
+  rm = rmT;
+);
+
+// min/max overview of the loop for the GFX display
+function buildOverview() local(c, a, b, i, st, mn, mx, s) global(LA, LL, OVN, bufL, bufR, ovMax, ovMin) (
+  c = 0;
+  loop(OVN,
+    a = LA + floor(c*LL/OVN);
+    b = LA + floor((c + 1)*LL/OVN);
+    b < a + 1 ? b = a + 1;
+    st = max(1, floor((b - a)/24));
+    mn = (bufL[a] + bufR[a])*0.5;
+    mx = mn;
+    i = a;
+    while (i < b) (
+      s = (bufL[i] + bufR[i])*0.5;
+      s < mn ? mn = s;
+      s > mx ? mx = s;
+      i += st;
+    );
+    ovMin[c] = mn;
+    ovMax[c] = mx;
+    c += 1;
+  );
+);
+
+// ------------------------------------------------------------------ live capture
+function beginCapture() local(tp, x) global(beatTab, cap, capLen, capPos, capSX, capState, capTempo, capTotal, engTarget, p_lenMode, p_loopBeats, p_loopMs, p_seamMs, srate, tempo) (
+  tp = tempo > 20 ? tempo : 120;
+  capTempo = tp;
+  x = floor(p_loopMs*0.001*srate + 0.5);
+  p_lenMode > 0.5 && p_lenMode < 1.5 ? ( x = floor(beatTab[floor(p_loopBeats + 0.5)]*60/tp*srate + 0.5); );
+  x = min(max(x, 64), cap - floor(srate*0.06) - 40);
+  capLen = x;
+  capSX = min(floor(p_seamMs*0.001*srate + 0.5), floor(x*0.25));
+  capSX < 2 ? capSX = 0;
+  capTotal = capLen + capSX + 4;
+  capPos = 0;
+  capState = 2;
+  engTarget = 0;
+);
+
+function finishCapture() global(LA, LL, SX, baseRate, capLen, capSX, capState, capTempo, engTarget, fileOK, loopValid, refTempo, rm, rmT) (
+  LA = 0; LL = capLen; SX = capSX; baseRate = 1; refTempo = capTempo;
+  loopValid = 1; fileOK = 0; capState = 0;
+  rmT = 1; rm = 1;
+  // playback starts after the seam tail was recorded: stay on the capture grid
+  resetProcess(0, capSX + 4);
+  buildOverview();
+  engTarget = 1;
+);
+
+// ------------------------------------------------------------------ audio file
+function loadFile() local(fh, items, frames, maxF, off, n, got, gotF, i, ok, chunkF) global(bufL, bufR, cap, capLen, fch, fileFrames, fileOK, fileRate, fsr, slider2, tmpF) (
+  fileOK = 0; fileFrames = 0; capLen = 0;
+  fh = file_open(slider2);
+  fh > 0 ? (
+    fch = 0; fsr = 0;
+    file_riff(fh, fch, fsr);
+    (fch >= 1 && fsr > 0) ? (
+      fileRate = fsr;
+      items = file_avail(fh);
+      frames = floor(items/fch);
+      maxF = cap - 16;
+      frames > maxF ? frames = maxF;
+      chunkF = max(1, floor(16384/fch));
+      off = 0;
+      ok = 1;
+      while (off < frames && ok) (
+        n = min(chunkF, frames - off);
+        got = file_mem(fh, tmpF, n*fch);
+        gotF = floor(got/fch);
+        gotF <= 0 ? ( ok = 0; ) : (
+          i = 0;
+          loop(gotF,
+            bufL[off + i] = sane(tmpF[i*fch]);
+            bufR[off + i] = fch >= 2 ? sane(tmpF[i*fch + 1]) : sane(tmpF[i*fch]);
+            i += 1;
+          );
+          off += gotF;
+        );
+      );
+      fileFrames = off;
+      fileOK = fileFrames >= 128;
+    );
+    file_close(fh);
+  );
+);
+
+// ------------------------------------------------------------------ analysis (GFX)
+function srcCorr(lag) local(i, n, ab, aa, bb, a, b, j) global(LA, LL, bufL) (
+  n = min(2048, LL - 1);
+  lag = floor(lag + 0.5);
+  lag = lag - floor(lag/LL)*LL;
+  ab = 0; aa = 0; bb = 0; i = 0;
+  loop(n,
+    j = i + lag;
+    j >= LL ? j -= LL;
+    a = bufL[LA + i];
+    b = bufL[LA + j];
+    ab += a*b; aa += a*a; bb += b*b;
+    i += 1;
+  );
+  (aa > 0.0000000001 && bb > 0.0000000001) ? ab/sqrt(aa*bb) : 0;
+);
+
+@slider
+pCoef = 1 - exp(-1/(0.015*srate));
+panCoef = 1 - exp(-1/(0.025*srate));
+corrCoef = 1 - exp(-1/(0.1*srate));
+engStep = 1/max(8, floor(0.010*srate));
+
+md = floor(p_mode + 0.5);
+stepped = (md == 0 || md == 1 || md == 4);
+nV = max(2, min(MAXV, floor(p_nVoices + 0.5)));
+curveI = floor(p_vgCurve + 0.5);
+depthI = max(2, min(4, floor(p_vgDepth + 0.5)));
+srcCh = floor(p_srcCh + 0.5);
+
+// Vaggione presets (maximum offset in ms); manual edits of the maximum fall back to Custom
+presetVal = p_vgPreset > 3.5 ? 48 : (p_vgPreset > 2.5 ? 31 : (p_vgPreset > 1.5 ? 3 : (p_vgPreset > 0.5 ? 1 : -1)));
+p_vgPreset != lastPreset ? (
+  lastPreset = p_vgPreset;
+  presetVal >= 0 ? (
+    p_vgMax = presetVal;
+    sliderchange(slider36);
+  );
+  lastMax = p_vgMax;
+) : (
+  p_vgMax != lastMax ? (
+    lastMax = p_vgMax;
+    (p_vgPreset > 0.5 && abs(p_vgMax - presetVal) > 0.0001) ? (
+      p_vgPreset = 0;
+      lastPreset = 0;
+      sliderchange(slider34);
+    );
+  );
+);
+
+(p_vgSeed != o_vgSeed) ? ( buildTables(p_vgSeed); );
+
+// change detection
+srcChg = (p_src != o_src);
+fileChg = (slider2 != o_file);
+latchChg = srcChg || (p_lenMode != o_lenMode) || (p_loopStart != o_loopStart) || (p_loopMs != o_loopMs) ||
+           (p_loopBeats != o_loopBeats) || (p_fileComp != o_fileComp) || (p_seamMs != o_seamMs);
+procChg = (p_mode != o_mode) || (p_nVoices != o_nV) || (p_clSeed != o_clSeed) || (p_clRand != o_clRand) ||
+          (p_clSpread != o_clSpread) || (p_vgSeed != o_vgSeed) || (p_vgUnit != o_vgUnit) || (p_xfMs != o_xf);
+o_src = p_src; o_file = slider2; o_lenMode = p_lenMode; o_loopStart = p_loopStart; o_loopMs = p_loopMs;
+o_loopBeats = p_loopBeats; o_fileComp = p_fileComp; o_seamMs = p_seamMs; o_mode = p_mode; o_nV = p_nVoices;
+o_clSeed = p_clSeed; o_clRand = p_clRand; o_clSpread = p_clSpread; o_vgSeed = p_vgSeed; o_vgUnit = p_vgUnit;
+o_xf = p_xfMs;
+
+srcChg ? ( capState = 0; );
+
+(p_src > 0.5 && (srcChg || fileChg)) ? (
+  // loading replaces the buffer: the engine is cut once, then fades in
+  engGain = 0; engTarget = 0;
+  loopValid = 0;
+  loadFile();
+  latchLoop();
+  loopValid ? (
+    resetProcess(0, 0);
+    buildOverview();
+    engTarget = 1;
+  );
+  latchPending = 0; procPending = 0;
+) : (
+  latchChg ? ( latchPending = 1; engTarget = 0; ) :
+  procChg ? ( procPending = 1; );
+);
+
+// capture request (button) - the slider resets itself
+(p_capTrig > 0.5) ? (
+  capReq = 1;
+  p_capTrig = 0;
+  sliderchange(slider3);
+);
+
+// slider visibility
+mAll = maskRange(16, 43);
+slider_show(mAll, 0);
+slider_show(md == 0 ? maskRange(34, 43) : (md == 1 ? maskRange(16, 18) : (md == 2 ? maskRange(19, 23) :
+           (md == 3 ? maskRange(24, 27) : (md == 4 ? maskRange(28, 29) : maskRange(30, 33))))), 1);
+slider_show(pow(2, 1) + pow(2, 5) + pow(2, 9), p_src > 0.5 ? 1 : 0);
+slider_show(pow(2, 2) + pow(2, 3), p_src > 0.5 ? 0 : 1);
+slider_show(pow(2, 6), (p_lenMode < 0.5 || p_lenMode > 1.5) ? 1 : 0);
+slider_show(pow(2, 7), (p_lenMode > 0.5 && p_lenMode < 1.5) ? 1 : 0);
+
+@block
+blkPos = 0;
+tp = tempo > 20 ? tempo : 120;
+isPlay = play_state & 1;
+
+// ---- transport: restart the process on play and on seeks (crossfaded, sample-aligned)
+(p_restart > 0.5 && loopValid && capState != 2) ? (
+  rq = 0;
+  (isPlay && !wasPlay) ? ( rq = 1; );
+  (isPlay && wasPlay && abs(beat_position - expBeat) > 0.5) ? ( rq = 1; );
+  rq ? ( resetProcess(1, 0); );
+);
+wasPlay = isPlay;
+expBeat = beat_position + samplesblock/srate*tp/60;
+
+// ---- pending loop edits are applied when the engine has faded out
+(latchPending && capState != 2 && engGain < 0.0005) ? (
+  latchPending = 0;
+  latchLoop();
+  loopValid ? (
+    resetProcess(0, 0);
+    buildOverview();
+    engTarget = 1;
+  );
+);
+(procPending && loopValid && !latchPending) ? (
+  procPending = 0;
+  resetProcess(1, 0);
+);
+
+// ---- capture arming / quantization
+capReq ? (
+  capReq = 0;
+  p_src < 0.5 ? ( capState = 1; capStartSample = -1; );
+);
+capState == 1 ? (
+  (p_capQuant < 0.5 || !isPlay) ? ( capStartSample = 0; ) : (
+    qb = p_capQuant < 1.5 ? 1 : ((ts_num > 0 && ts_denom > 0) ? ts_num*4/ts_denom : 4);
+    nb = ceil(beat_position/qb - 0.0001)*qb;
+    s2b = (nb - beat_position)*60/tp*srate;
+    capStartSample = s2b < samplesblock ? max(0, floor(s2b + 0.5)) : -1;
+  );
+);
+
+// ---- rates
+hostRate = (p_tempoFollow > 0.5 && refTempo > 0) ? tp/refTempo : 1;
+rmT = min(max(baseRate*hostRate, 0.05), 4);
+
+v = 0;
+loop(MAXV, vRel[v] = 1; v += 1;);
+md == 2 ? (
+  dd = p_pnUnit > 0.5 ? p_pnBpm/tp : p_pnPpm*0.000001;
+  rp = p_pnRamp > 0 ? min(1, tProc/p_pnRamp) : 1;
+  sg = p_pnDir > 0.5 ? -1 : 1;
+  v = 0;
+  loop(MAXV, vRel[v] = min(max(1 + sg*dd*rp*v, 0.25), 4); v += 1;);
+) : md == 3 ? (
+  ds = p_stDur; hd = p_stHold;
+  sh = tProc < ds ? tProc/ds : (tProc < ds + hd ? 1 : (p_stRet > 0.5 ? (tProc < 2*ds + hd ? 1 - (tProc - ds - hd)/ds : 0) : 1));
+  v = 0;
+  loop(MAXV, vRel[v] = min(max(1 + v*p_stTarget*0.01*sh, 0.25), 4); v += 1;);
+) : md == 5 ? (
+  v = 0;
+  loop(MAXV, vRel[v] = min(max(1 + p_clDrift*0.000001*v, 0.25), 4); v += 1;);
+);
+(loopValid && engGain > 0.0001) ? ( tProc += samplesblock/srate; );
+
+// ---- spatial targets (smoothed per sample)
+rt = floor(p_route + 0.5);
+v = 0;
+loop(MAXV,
+  n = nV > 1 ? (v/(nV - 1))*2 - 1 : 0;
+  pan = rt == 0 ? n*p_width : (rt == 1 ? ((v % 2) == 0 ? -1 : 1)*p_width : 0);
+  srcCh == 1 ? (
+    a = (pan + 1)*$pi*0.25;
+    gl = cos(a); gr = sin(a);
+  ) : (
+    gl = pan > 0 ? cos(pan*PI2) : 1;
+    gr = pan < 0 ? cos(-pan*PI2) : 1;
+  );
+  vTL[v] = gl; vTR[v] = gr;
+  v += 1;
+);
+vNorm = 1/sqrt(nV);
+
+mixP = p_mix*0.01;
+wetT = sin(mixP*PI2);
+dryT0 = cos(mixP*PI2);
+lvlT = exp(p_level*0.1151292546);
+
+den = sqrt(cLL*cRR);
+corrV = den > 0.0000000001 ? cLR/den : 0;
+
+@sample
+inL = sane(spl0);
+inR = sane(spl1);
+
+(capState == 1 && capStartSample >= 0 && blkPos >= capStartSample) ? (
+  beginCapture();
+  capStartSample = -1;
+);
+blkPos += 1;
+
+capState == 2 ? (
+  bufL[capPos] = inL;
+  bufR[capPos] = inR;
+  capPos += 1;
+  capPos >= capTotal ? ( finishCapture(); );
+);
+
+engGain += min(max(engTarget - engGain, -engStep), engStep);
+wetL = 0; wetR = 0;
+
+(loopValid && engGain > 0.00001) ? (
+  rm += (rmT - rm)*pCoef;
+
+  v = 0;
+  loop(nV, vPhi[v] += rm*vRel[v]; v += 1;);
+  stepped ? (
+    vPhi[0] >= cycLen ? (
+      v = 0;
+      loop(nV, vPhi[v] -= cycLen; v += 1;);
+      cycleIdx += 1;
+      retarget(0);
+    );
+  ) : (
+    v = 0;
+    loop(nV,
+      p = vPhi[v];
+      p >= LL ? p -= LL;
+      p >= LL ? p -= LL;
+      vPhi[v] = p;
+      v += 1;
+    );
+  );
+
+  v = 0;
+  loop(nV,
+    p = vPhi[v] + vD0[v];
+    p = p - floor(p/LL)*LL;
+    vPos[v] = p;
+    rdv(p);
+    yL = oL; yR = oR;
+    xf = vXf[v];
+    xf < 1 ? (
+      p = vPhi[v] + vD1[v];
+      p = p - floor(p/LL)*LL;
+      rdv(p);
+      w = xf*xf*(3 - 2*xf);
+      yL = yL*w + oL*(1 - w);
+      yR = yR*w + oR*(1 - w);
+      xf += xfInc;
+      xf >= 1 ? xf = 1;
+      vXf[v] = xf;
+    );
+    gl = vGL[v] + (vTL[v] - vGL[v])*panCoef;
+    gr = vGR[v] + (vTR[v] - vGR[v])*panCoef;
+    vGL[v] = gl; vGR[v] = gr;
+    wetL += yL*gl;
+    wetR += yR*gr;
+    v += 1;
+  );
+  wetL = sane(wetL*vNorm*engGain);
+  wetR = sane(wetR*vNorm*engGain);
+);
+
+cLR += (wetL*wetR - cLR)*corrCoef;
+cLL += (wetL*wetL - cLL)*corrCoef;
+cRR += (wetR*wetR - cRR)*corrCoef;
+
+dryT = capState == 2 ? 1 : dryT0;
+dryS += (dryT - dryS)*pCoef;
+wetS += (wetT - wetS)*pCoef;
+lvlS += (lvlT - lvlS)*pCoef;
+
+outL = inL*dryS + wetL*wetS;
+outR = inR*dryS + wetR*wetS;
+p_monoOut > 0.5 ? (
+  mm = (outL + outR)*0.5;
+  outL = mm; outR = mm;
+);
+spl0 = softclip(sane(outL*lvlS));
+spl1 = softclip(sane(outR*lvlS));
+
+@gfx 720 380
+gfx_clear = 17 + 19*256 + 21*65536;
+GW = gfx_w; GH = gfx_h;
+gfx_setfont(1, "Arial", 13);
+
+// ---- header
+gfx_set(0.84, 0.93, 0.45, 1);
+gfx_setfont(2, "Arial", 20);
+gfx_x = 14; gfx_y = 8;
+gfx_drawstr("SAMPLE PHASE LAB");
+gfx_setfont(1, "Arial", 13);
+gfx_set(0.64, 0.68, 0.68, 1);
+gfx_x = 14; gfx_y = 34;
+md == 0 ? gfx_drawstr("Vaggione - dynamic multi-local decorrelation") :
+md == 1 ? gfx_drawstr("Sample Phase - discrete sample advance per loop") :
+md == 2 ? gfx_drawstr("Piano Phase - continuous tempo difference") :
+md == 3 ? gfx_drawstr("Piano Phase - stepped tempo acceleration") :
+md == 4 ? gfx_drawstr("Fixed phase - constant displacement") :
+          gfx_drawstr("Phase cloud - offset and drifting voices");
+
+// capture button / status
+bx = GW - 150; by = 10; bw = 136; bh = 26;
+p_src < 0.5 ? (
+  gHot = (mouse_x >= bx && mouse_x <= bx + bw && mouse_y >= by && mouse_y <= by + bh);
+  capState == 0 ? gfx_set(0.14, 0.16, 0.17, 1) : gfx_set(0.94, 0.55, 0.49, 1);
+  gfx_rect(bx, by, bw, bh);
+  gfx_set(0.22, 0.25, 0.28, 1);
+  gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1); gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+  capState == 0 ? gfx_set(0.93, 0.94, 0.93, 1) : gfx_set(0.07, 0.08, 0.08, 1);
+  gfx_x = bx + 12; gfx_y = by + 6;
+  capState == 0 ? gfx_drawstr("CAPTURE LOOP") : (capState == 1 ? gfx_drawstr("ARMED...") : gfx_drawstr("RECORDING"));
+  ((mouse_cap & 1) && !prevMouse && gHot && capState == 0) ? ( capReq = 1; );
+) : (
+  gfx_set(0.64, 0.68, 0.68, 1);
+  gfx_x = bx; gfx_y = by + 6;
+  fileOK ? gfx_drawstr("file loaded") : gfx_drawstr("no file loaded");
+);
+prevMouse = mouse_cap & 1;
+
+// ---- waveform panel
+px = 14; py = 58; pw = GW - 28; ph = 100;
+gfx_set(0.106, 0.122, 0.133, 1);
+gfx_rect(px, py, pw, ph);
+gfx_set(0.22, 0.25, 0.28, 1);
+gfx_rect(px, py + ph*0.5, pw, 1);
+loopValid ? (
+  gfx_set(0.84, 0.93, 0.45, 0.85);
+  gC = 0;
+  loop(pw - 1,
+    gCi = floor(gC*OVN/pw);
+    gY1 = py + ph*0.5 - ovMax[gCi]*ph*0.46;
+    gY2 = py + ph*0.5 - ovMin[gCi]*ph*0.46;
+    gfx_line(px + gC, gY1, px + gC, max(gY2, gY1 + 1));
+    gC += 1;
+  );
+  // voice playheads
+  gV = 0;
+  loop(nV,
+    gXx = px + (vPos[gV]/LL)*pw;
+    gfx_set(0.55 + 0.4*(gV/MAXV), 0.78 - 0.3*(gV/MAXV), 0.82 - 0.5*(gV/MAXV), 0.9);
+    gfx_line(gXx, py, gXx, py + ph);
+    gfx_x = gXx + 3; gfx_y = py + 2 + (gV % 3)*11;
+    gfx_setfont(3, "Arial", 10);
+    gfx_drawnumber(gV + 1, 0);
+    gV += 1;
+  );
+  gfx_setfont(1, "Arial", 13);
+) : (
+  gfx_set(0.64, 0.68, 0.68, 1);
+  gfx_x = px + 14; gfx_y = py + ph*0.5 - 7;
+  p_src < 0.5 ? gfx_drawstr("No loop yet - press CAPTURE LOOP (the loop length follows the Loop length setting)")
+              : gfx_drawstr("Choose an audio file in the Data/phase_lab folder (slider 2)");
+);
+
+// ---- phase ring
+ringR = 62; cx = 14 + 80; cy = 176 + ringR + 6;
+gfx_set(0.22, 0.25, 0.28, 1);
+gfx_circle(cx, cy, ringR, 0, 1);
+gfx_circle(cx, cy, ringR*0.5, 0, 1);
+gfx_line(cx, cy - ringR, cx, cy + ringR);
+gfx_line(cx - ringR, cy, cx + ringR, cy);
+loopValid ? (
+  gV = 0;
+  loop(nV,
+    gAng = (vPos[gV]/LL)*2*$pi - $pi*0.5;
+    gRr = ringR*(1 - 0.35*(gV/MAXV));
+    gfx_set(0.55 + 0.4*(gV/MAXV), 0.78 - 0.3*(gV/MAXV), 0.82 - 0.5*(gV/MAXV), 1);
+    gfx_circle(cx + cos(gAng)*gRr, cy + sin(gAng)*gRr, 4, 1, 1);
+    gV += 1;
+  );
+);
+gfx_set(0.64, 0.68, 0.68, 1);
+gfx_x = cx - 30; gfx_y = cy + ringR + 6;
+gfx_drawstr("loop phase of every voice");
+
+// ---- readouts
+tx = 200; ty = 176;
+loopMs = loopValid ? LL/(baseRate*srate)*1000 : 0;
+gfx_set(0.93, 0.94, 0.93, 1);
+gfx_x = tx; gfx_y = ty;
+loopValid ? (
+  sprintf(#s, "loop %.2f ms  |  %d samples  |  repetition %d", loopMs, LL, cycleIdx);
+  gfx_drawstr(#s);
+);
+gfx_set(0.64, 0.68, 0.68, 1);
+gfx_x = tx; gfx_y = ty + 18;
+sprintf(#s, "host %.2f BPM  |  loop made at %.2f BPM  |  playback rate %.5f", tempo, refTempo, rm);
+gfx_drawstr(#s);
+
+// inter-voice offset (voice 2 relative to voice 1) and the perceptual zone from the article
+d01 = vPos[1] - vPos[0];
+d01 = d01 - floor(d01/LL + 0.5)*LL;
+ms01 = loopValid ? d01/(baseRate*srate)*1000 : 0;
+gfx_x = tx; gfx_y = ty + 40;
+gfx_set(0.55, 0.79, 0.82, 1);
+sprintf(#s, "offset voice 2 vs 1: %.3f ms  (%d samples)", ms01, floor(d01 + 0.5));
+gfx_drawstr(#s);
+am = abs(ms01);
+gfx_x = tx; gfx_y = ty + 58;
+gfx_set(0.84, 0.93, 0.45, 1);
+am < 1.5 ? gfx_drawstr("< 1.5 ms: image stays fused - colouring / combing, no space") :
+am < 10 ? gfx_drawstr("~3 ms zone: space perception appears (decorrelated replica)") :
+am < 30 ? gfx_drawstr("10-30 ms: widening and spatial field") :
+am <= 70 ? gfx_drawstr("30-70 ms: directionality and voice parsing (Agon: 31 ms)") :
+           gfx_drawstr("> 70 ms: discrete echo / rhythmic displacement");
+
+// process-specific line
+gfx_set(0.64, 0.68, 0.68, 1);
+gfx_x = tx; gfx_y = ty + 80;
+md == 1 ? (
+  sprintf(#s, "sample step %d per repetition = %.5f ms", p_spShift*p_spMult, p_spShift*p_spMult/(baseRate*srate)*1000);
+  gfx_drawstr(#s);
+) : md == 2 ? (
+  dd2 = p_pnUnit > 0.5 ? p_pnBpm/max(tempo, 20) : p_pnPpm*0.000001;
+  sprintf(#s, "voice 2 drift %.1f ppm  |  realigns every %.1f s", dd2*1000000, dd2 > 0.0000001 ? loopMs*0.001/dd2 : 0);
+  gfx_drawstr(#s);
+) : md == 3 ? (
+  sprintf(#s, "ramp %.2f %% over %.0f s  |  elapsed %.1f s", p_stTarget, p_stDur, tProc);
+  gfx_drawstr(#s);
+) : md == 0 ? (
+  sprintf(#s, "trajectory %.2f - %.2f ms (+ %.2f ms/voice)  |  update step %d", p_vgMin, max(p_vgMax, p_vgMin), p_vgSpread, cycleIdx);
+  gfx_drawstr(#s);
+) : (
+  sprintf(#s, "elapsed %.1f s", tProc);
+  gfx_drawstr(#s);
+);
+
+// estimated source correlation at the current inter-voice lag (prototype metric)
+gfx_x = tx; gfx_y = ty + 98;
+loopValid ? (
+  sprintf(#s, "source correlation at that lag: %.3f", srcCorr(d01));
+  gfx_drawstr(#s);
+);
+
+// ---- L/R correlation meter (phase status, as called for in the article)
+mx0 = tx; my0 = ty + 124; mw = GW - tx - 14; mh = 14;
+gfx_set(0.106, 0.122, 0.133, 1);
+gfx_rect(mx0, my0, mw, mh);
+gfx_set(0.22, 0.25, 0.28, 1);
+gfx_rect(mx0 + mw*0.5, my0, 1, mh);
+cv = min(max(corrV, -1), 1);
+cv >= 0 ? gfx_set(0.84, 0.93, 0.45, 1) : gfx_set(0.94, 0.55, 0.49, 1);
+cv >= 0 ? gfx_rect(mx0 + mw*0.5, my0 + 2, mw*0.5*cv, mh - 4) : gfx_rect(mx0 + mw*0.5 + mw*0.5*cv, my0 + 2, -mw*0.5*cv, mh - 4);
+gfx_set(0.64, 0.68, 0.68, 1);
+gfx_x = mx0; gfx_y = my0 + 18;
+sprintf(#s, "L/R phase correlation %.2f   (-1 anti-phase | 0 decorrelated | +1 mono)", corrV);
+gfx_drawstr(#s);
+gfx_x = mx0; gfx_y = my0 + 36;
+p_monoOut > 0.5 ? (
+  gfx_set(0.94, 0.55, 0.49, 1);
+  gfx_drawstr("MONO SUM: decorrelation turns into frequency-domain combing (flanging)");
+) : (
+  p_guard > 0.5 ? gfx_drawstr("phase guard on: nudging a voice when correlation turns negative") : gfx_drawstr("stereo: offsets are heard as space");
+);

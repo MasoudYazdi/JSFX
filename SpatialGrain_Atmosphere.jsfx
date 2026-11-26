@@ -1,0 +1,140 @@
+desc:Spatial Granulation Atmosphere (Distance-Aware Quad Reverb)
+options:gmem=SpatialGrain
+
+in_pin:Input FL
+in_pin:Input FR
+in_pin:Input BL
+in_pin:Input BR
+out_pin:Output FL
+out_pin:Output FR
+out_pin:Output BL
+out_pin:Output BR
+
+slider1:manual_wet=0.25<0,1,0.001>Manual Wet Amount
+slider2:auto_amount=0.7<0,1,0.001>Engine-Driven Amount
+slider3:decay=0.6<0,0.97,0.001>Decay (Feedback)
+slider4:damping=0.5<0,1,0.001>High-Frequency Damping
+slider5:size_scale=1<0.25,2,0.01>Room Size Scale
+slider6:dry_gain_db=0<-24,6,0.1>Dry Gain (dB)
+slider7:wet_gain_db=0<-24,12,0.1>Wet Gain (dB)
+
+@init
+
+function ms2smp(ms) ( floor(ms * 0.001 * srate); );
+
+// four mutually-prime-ish base delay times, mixed with a Hadamard matrix
+base0 = ms2smp(38.3);
+base1 = ms2smp(36.4);
+base2 = ms2smp(46.6);
+base3 = ms2smp(51.1);
+
+maxlen = ms2smp(120) + 64;
+
+mptr = 0;
+d0 = mptr; mptr += maxlen;
+d1 = mptr; mptr += maxlen;
+d2 = mptr; mptr += maxlen;
+d3 = mptr; mptr += maxlen;
+
+wp0 = 0; wp1 = 0; wp2 = 0; wp3 = 0;
+lp0 = 0; lp1 = 0; lp2 = 0; lp3 = 0;
+
+smooth_wet   = manual_wet;
+smooth_auto  = auto_amount;
+smooth_decay = decay;
+smooth_damp  = damping;
+smooth_size  = size_scale;
+smooth_dry   = 10 ^ (dry_gain_db / 20);
+smooth_wetg  = 10 ^ (wet_gain_db / 20);
+
+// smoothed copies of the Engine's shared spatial state (gmem)
+g_avgdist   = 0;
+g_count     = 0;
+g_air       = 0;
+g_distdepth = 0;
+
+@block
+
+coef = 1 - exp(-1 / (0.01 * srate));
+smooth_wet   += (manual_wet - smooth_wet) * coef;
+smooth_auto  += (auto_amount - smooth_auto) * coef;
+smooth_decay += (decay - smooth_decay) * coef;
+smooth_damp  += (damping - smooth_damp) * coef;
+smooth_size  += (size_scale - smooth_size) * coef;
+smooth_dry   += (10 ^ (dry_gain_db / 20) - smooth_dry) * coef;
+smooth_wetg  += (10 ^ (wet_gain_db / 20) - smooth_wetg) * coef;
+
+// pull the Engine's live grain-cloud stats out of shared gmem
+g_avgdist   += (gmem[0] - g_avgdist) * coef;
+g_count     += (gmem[1] - g_count) * coef;
+g_air       += (gmem[3] - g_air) * coef;
+g_distdepth += (gmem[4] - g_distdepth) * coef;
+
+len0 = min(maxlen - 1, max(4, floor(base0 * smooth_size)));
+len1 = min(maxlen - 1, max(4, floor(base1 * smooth_size)));
+len2 = min(maxlen - 1, max(4, floor(base2 * smooth_size)));
+len3 = min(maxlen - 1, max(4, floor(base3 * smooth_size)));
+
+// far-flung, dense grain clouds pull the reverb open automatically
+auto_wet = min(1, g_avgdist * (0.5 + g_distdepth)) * min(1, g_count / 6);
+wet = smooth_wet * (1 - smooth_auto) + auto_wet * smooth_auto;
+
+dampcut = 0.15 + (smooth_damp + g_air * 0.5) * 0.7;
+dampcut = min(dampcut, 0.95);
+
+fb = smooth_decay;
+
+@sample
+
+rp0 = wp0 - len0; rp0 < 0 ? rp0 += maxlen;
+rp1 = wp1 - len1; rp1 < 0 ? rp1 += maxlen;
+rp2 = wp2 - len2; rp2 < 0 ? rp2 += maxlen;
+rp3 = wp3 - len3; rp3 < 0 ? rp3 += maxlen;
+
+y0 = d0[rp0];
+y1 = d1[rp1];
+y2 = d2[rp2];
+y3 = d3[rp3];
+
+// damping filter in the feedback path (air absorption on the tail)
+lp0 = lp0 + (y0 - lp0) * dampcut;
+lp1 = lp1 + (y1 - lp1) * dampcut;
+lp2 = lp2 + (y2 - lp2) * dampcut;
+lp3 = lp3 + (y3 - lp3) * dampcut;
+
+// Hadamard mix — decorrelates the four lines for a diffuse quad tail
+h0 = 0.5 * (lp0 + lp1 + lp2 + lp3);
+h1 = 0.5 * (lp0 - lp1 + lp2 - lp3);
+h2 = 0.5 * (lp0 + lp1 - lp2 - lp3);
+h3 = 0.5 * (lp0 - lp1 - lp2 + lp3);
+
+in0 = spl0 + h0 * fb;
+in1 = spl1 + h1 * fb;
+in2 = spl2 + h2 * fb;
+in3 = spl3 + h3 * fb;
+
+// soft clip inside the loop, not a hard limiter, to keep the tail smooth
+in0 = in0 / (1 + abs(in0) * 0.3);
+in1 = in1 / (1 + abs(in1) * 0.3);
+in2 = in2 / (1 + abs(in2) * 0.3);
+in3 = in3 / (1 + abs(in3) * 0.3);
+
+d0[wp0] = in0;
+d1[wp1] = in1;
+d2[wp2] = in2;
+d3[wp3] = in3;
+
+wp0 += 1; wp0 >= maxlen ? wp0 = 0;
+wp1 += 1; wp1 >= maxlen ? wp1 = 0;
+wp2 += 1; wp2 >= maxlen ? wp2 = 0;
+wp3 += 1; wp3 >= maxlen ? wp3 = 0;
+
+outFL = spl0 * smooth_dry + y0 * wet * smooth_wetg;
+outFR = spl1 * smooth_dry + y1 * wet * smooth_wetg;
+outBL = spl2 * smooth_dry + y2 * wet * smooth_wetg;
+outBR = spl3 * smooth_dry + y3 * wet * smooth_wetg;
+
+spl0 = outFL / (1 + abs(outFL));
+spl1 = outFR / (1 + abs(outFR));
+spl2 = outBL / (1 + abs(outBL));
+spl3 = outBR / (1 + abs(outBR));

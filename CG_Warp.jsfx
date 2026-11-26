@@ -1,0 +1,205 @@
+desc:CG Warp - varispeed / pitch warp / tape-stop / slip / wow (two-head delay-line, no resynthesis)
+tags:musique-concrete varispeed tape live
+slider1:0<-24,24,0.01>Pitch (semitones)
+slider2:0<-100,100,0.1>Fine (cents)
+slider3:0<0,1,1{Forward,Reverse}>Direction
+slider4:60<10,250,1:log>Window (ms)
+slider5:40<5,2000,1:log>Glide (ms)
+slider6:0<0,1,1{Run,Stop}>Tape Stop
+slider7:0.8<0.05,5,0.01>Stop / Start Time (s)
+slider8:0<0,100,0.1>Wow Depth (cents)
+slider9:1.5<0.1,8,0.01>Wow Rate (Hz)
+slider10:0<0,4,0.01>Slip Rate (events/s)
+slider11:7<0,24,0.1>Slip Range (semitones)
+slider12:250<30,1500,1>Slip Duration (ms)
+slider13:8<0,60,0.1>Stereo Detune (cents)
+slider14:-3<-60,6,0.1>Wet (dB)
+slider15:0<-60,6,0.1>Dry (dB)
+slider16:0<0,3,1{Auto,L,R,L+R}>Input
+slider17:1<1,4,1>Analysis Bus (1-4)
+slider18:0<0,6,1{None,Level,Onset,Brightness,Noisiness,Flux,Pitch}>Mod Source
+slider19:0<-12,12,0.1>Mod -> Pitch (semitones)
+slider20:0<0,1,1{-,PANIC}>Panic / Clear
+
+in_pin:Input L
+in_pin:Input R
+out_pin:Output L
+out_pin:Output R
+options:gmem=CGbus no_meter
+
+@init
+
+ext_noinit=1;
+PI=3.141592653589793; TWOPI=6.283185307179586; CEIL=2;
+
+// ---- NaN-safe primitives. Comparisons with NaN are false, so every function below maps NaN/inf to a finite value ----
+function lim(x,lo,hi) ( x>=lo ? (x<=hi ? x : hi) : lo );
+function fin(x) ( abs(x)<100000 ? x : 0 );
+function db2lin(d) ( exp(lim(d,-120,60)*0.11512925464970229) );
+function dbgain(d) ( d<=-59.9 ? 0 : db2lin(d) );
+function lin2db(x) ( 8.685889638065035*log(abs(x)+0.000000001) );
+function sat(x) ( abs(x)<3 ? x*(27+x*x)/(27+9*x*x) : (x>0 ? 1 : -1) );
+function sclip(x,c) local(ax,k,y) ( ax=abs(x); k=c*0.7; y=ax<k ? ax : k+(c-k)*sat((ax-k)/(c-k)); x<0 ? -y : y );
+function mixf(a,b,t) ( a+(b-a)*t );
+function lpc(fc) ( 1-exp(-TWOPI*lim(fc,1,srate*0.45)/srate) );
+function smooth01(t) ( t<=0 ? 0 : (t>=1 ? 1 : t*t*(3-2*t)) );
+function rnd() ( rng=rng*1664525+1013904223; rng-=floor(rng/4294967296)*4294967296; rng/4294967296 );
+function rnds() ( rnd()*2-1 );
+function alloc(n) local(p) ( p=mp; mp+=n; memset(p,0,n); p );
+
+// ---- mono input pick (guitar usually lives on one channel) + DC block ----
+function pick_in() local(yy) (
+  eL+=(inL*inL-eL)*0.0005; eR+=(inR*inR-eR)*0.0005;
+  imode<0.5 ? ( xm = eR<0.0005*eL ? inL : (eL<0.0005*eR ? inR : (inL+inR)*0.5) )
+  : ( imode<1.5 ? ( xm=inL ) : ( imode<2.5 ? ( xm=inR ) : ( xm=(inL+inR)*0.5 ) ) );
+  yy=xm-dcx+dcr*dcy; dcx=xm; dcy=yy; xm=fin(yy);
+);
+
+// ---- onset detector (fast/slow envelope ratio with refractory time) ----
+function ons_proc(x) local(a) (
+  a=abs(x);
+  ons_f+=(a-ons_f)*(a>ons_f ? ons_kfa : ons_kfr);
+  ons_s+=(a-ons_s)*(a>ons_s ? ons_ksa : ons_ksr);
+  ons_ev=0;
+  ons_cool>0 ? ons_cool-=1;
+  (ons_cool<=0 && ons_f>ons_thr && ons_f>ons_s*ons_ratio) ? ( ons_ev=1; ons_cool=ons_refr; ons_cnt+=1; );
+);
+
+// ---- analysis bus (written by CG_Analyzer, optional for every other module) ----
+function bus_update() (
+  bus_b=(lim(floor(bus_sel+0.5),1,4)-1)*16;
+  hb=gmem[bus_b];
+  abs(hb-hb_last)>0.5 ? ( hb_last=hb; bus_stale=0; ) : ( bus_stale+=samplesblock; );
+  bus_alive=bus_stale<srate*0.4;
+);
+function bus_get(sel) ( (sel>0.5 && bus_alive) ? lim(gmem[bus_b+floor(sel+0.5)],0,1) : 0 );
+function bus_onset() local(c,r) ( r=0; bus_alive ? ( c=gmem[bus_b+10]; abs(c-bus_cnt_last)>0.5 ? ( r=1; bus_cnt_last=c; ); ); r );
+mp=0;
+
+RB=floor(srate*0.6)+64;
+buf=alloc(RB);
+BASE=24;
+wp=0; phL=0; phR=0.13; wph=0; rate_s=1; st_g=1; sl_s=0; sl_t=0; sl_cnt=0; sl_timer=srate;
+stop=0; rev=0; k_gl=0.01; st_step=0.0001; md_pitch=0; slip_r=0; slip_rng=7; slip_dur=0.25*srate;
+k_sl=1-exp(-1/(0.02*srate)); Wn=0.06*srate; k_w=1-exp(-1/(0.2*srate));
+
+function do_clear() ( memset(buf,0,RB); );
+function rd(lag) local(rp,i0,fr,i1) (
+  rp=wp-lag; rp<0 ? (rp+=RB); rp>=RB ? (rp-=RB);
+  i0=floor(rp); fr=rp-i0; i1=i0+1; i1>=RB ? (i1=0); i0>=RB ? (i0=RB-1); i0<0 ? (i0=0);
+  buf[i0]*(1-fr)+buf[i1]*fr
+);
+// two crossfading heads; returns blended output for phase ph (must be in [0,1))
+function heads(ph,Wsm) local(p2,w1,w2,sA,sB) (
+  p2=ph+0.5; p2>=1 ? (p2-=1);
+  w1=sin(3.141592653589793*ph); w1=w1*w1;
+  w2=1-w1;
+  sA=rd(BASE+ph*Wsm); sB=rd(BASE+p2*Wsm);
+  sA*w1+sB*w2
+);
+
+function read_params() (
+
+bus_sel=slider17; imode=slider16; msel=slider18;
+T_wet=dbgain(slider14); T_dry=dbgain(slider15);
+T_win=lim(slider4,10,250); T_det=lim(slider13,0,60);
+T_wowd=lim(slider8,0,100); T_wowr=lim(slider9,0.1,8);
+T_pitch=lim(slider1,-24,24); T_fine=lim(slider2,-100,100);
+md_pitch=lim(slider19,-12,12); mod_t=bus_get(msel);
+rev=slider3>0.5; stop=slider6>0.5;
+k_gl=1-exp(-1/(lim(slider5,5,2000)*0.001*srate));
+st_step=1/(lim(slider7,0.05,5)*srate);
+slip_r=lim(slider10,0,4); slip_rng=lim(slider11,0,24); slip_dur=lim(slider12,30,1500)*0.001*srate;
+
+);
+function copy_params() ( P_wet=T_wet; P_dry=T_dry; P_win=T_win; P_det=T_det; P_wowd=T_wowd; P_wowr=T_wowr; P_pitch=T_pitch; P_fine=T_fine; );
+
+// ---- panic machine: fade wet out, clear every buffer, fade back in. Triggered by button or by internal watchdog ----
+function panic_step() (
+  (panic_req>0.5 && pan_ph==0) ? ( pan_ph=1; );
+  panic_req=0;
+  pan_ph==1 ? ( pan_g-=pan_dn; pan_g<=0 ? ( pan_g=0; do_clear(); pan_ph=2; pan_hold=floor(0.03*srate); ); );
+  pan_ph==2 ? ( pan_hold-=1; pan_hold<=0 ? ( pan_ph=3; ); );
+  pan_ph==3 ? ( pan_g+=pan_up; pan_g>=1 ? ( pan_g=1; pan_ph=0; ); );
+  pan_gs=pan_g*pan_g*(3-2*pan_g);
+);
+
+// ---- final stage: wet DC block, dry/wet sum, finite scrub, soft ceiling at +6 dB ----
+function finish() local(yy) (
+  wL=fin(wL); wR=fin(wR);
+  yy=wL-wxL+dcr*wyL; wxL=wL; wyL=yy; wL=yy;
+  yy=wR-wxR+dcr*wyR; wxR=wR; wyR=yy; wR=yy;
+  oL=sclip(fin(inL*P_dry+wL*P_wet*pan_gs),CEIL);
+  oR=sclip(fin(inR*P_dry+wR*P_wet*pan_gs),CEIL);
+  spl0=oL; spl1=oR;
+);
+
+smc=1-exp(-1/(0.015*srate));
+kmod=1-exp(-1/(0.004*srate));
+dcr=1-TWOPI*10/srate;
+pan_dn=1/(0.01*srate); pan_up=1/(0.05*srate); pan_g=1; pan_gs=1; pan_ph=0; panic_req=0;
+ons_kfa=1-exp(-1/(0.001*srate)); ons_kfr=1-exp(-1/(0.025*srate));
+ons_ksa=1-exp(-1/(0.040*srate)); ons_ksr=1-exp(-1/(0.250*srate));
+ons_ratio=2.2; ons_thr=db2lin(-52); ons_refr=floor(0.07*srate);
+bus_sel=1; imode=0; pfirst=1;
+rng=7004;
+
+@block
+
+bus_update();
+pan_btn=slider20; (pan_btn>0.5 && pan_prev<0.5) ? ( panic_req=1; ); pan_prev=pan_btn;
+read_params();
+pfirst ? ( copy_params(); pfirst=0; );
+
+
+@sample
+
+inL=fin(spl0); inR=fin(spl1);
+pick_in();
+ons_proc(xm);
+panic_step();
+mod_s+=(mod_t-mod_s)*kmod;
+P_wet+=(T_wet-P_wet)*smc;
+P_dry+=(T_dry-P_dry)*smc;
+P_win+=(T_win-P_win)*smc;
+P_det+=(T_det-P_det)*smc;
+P_wowd+=(T_wowd-P_wowd)*smc;
+P_wowr+=(T_wowr-P_wowr)*smc;
+P_pitch+=(T_pitch-P_pitch)*smc;
+P_fine+=(T_fine-P_fine)*smc;
+
+buf[wp]=xm;
+Wn+=(P_win*0.001*srate-Wn)*k_w;
+// ---- slip scheduler ----
+sl_timer-=1;
+sl_timer<=0 ? (
+  slip_r>0.01 ? ( sl_t=(rnd()*2-1)*slip_rng; sl_cnt=slip_dur; sl_timer=srate/slip_r*(0.5+rnd()); )
+              : ( sl_timer=srate*0.1; );
+);
+sl_cnt>0 ? ( sl_cnt-=1; sl_cnt<=0 ? ( sl_t=0; ); );
+sl_s+=(sl_t-sl_s)*k_sl;
+// ---- wow ----
+wph+=P_wowr/srate; wph-=floor(wph);
+wow=P_wowd*sin(TWOPI*wph);
+// ---- tape stop ramp ----
+st_g+=(stop ? -st_step : st_step); st_g=lim(st_g,0,1);
+// ---- rate ----
+semi=P_pitch+md_pitch*mod_s+P_fine*0.01+sl_s+wow*0.01;
+rt=exp(lim(semi,-48,48)*0.05776226504666211)*(rev ? -1 : 1)*st_g;
+rt=lim(rt,-3,4);
+rate_s+=(rt-rate_s)*k_gl;
+rate_s=lim(rate_s,-3,4);
+dm=exp(P_det*0.000288811325233);   // +-detune/2 in cents
+rl=rate_s/dm; rr=rate_s*dm;
+phL+=(1-rl)/max(Wn,64); phL-=floor(phL); (phL>=0 && phL<1) ? 0 : (phL=0);
+phR+=(1-rr)/max(Wn,64); phR-=floor(phR); (phR>=0 && phR<1) ? 0 : (phR=0);
+cl=rd(BASE);
+wmL=lim(abs(rl-1)/0.015,0,1); wmR=lim(abs(rr-1)/0.015,0,1);
+yL=mixf(cl,heads(phL,Wn),wmL);
+yR=mixf(cl,heads(phR,Wn),wmR);
+lowg=smooth01(abs(rate_s)/0.06);
+wL=yL*lowg; wR=yR*lowg;
+wp+=1; wp>=RB ? (wp=0);
+(abs(wL)<20 && abs(wR)<20) ? 0 : ( panic_req=1; wL=0; wR=0; );
+finish();
+

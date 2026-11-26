@@ -1,0 +1,351 @@
+desc:Riemannian Manifold Pitch-Space
+
+// ============================================================================
+// RIEMANNIAN MANIFOLD PITCH-SPACE
+// ============================================================================
+// Pitch height x (semitones, unwrapped) is treated as a 1D Riemannian manifold
+// with a conformally flat metric:
+//
+//      g(x) = e^(2*phi(x))
+//
+// phi(x) is a periodic potential (period = 12 semitones / one octave) built
+// from Gaussian wells centered at up to 4 attractor pitch classes (a sieve /
+// scale). For this metric the single nonzero Christoffel symbol is
+//
+//      Gamma(x) = phi'(x)
+//
+// so the geodesic equation d^2x/dt^2 + Gamma * (dx/dt)^2 = 0 becomes
+//
+//      x_ddot = -phi'(x) * x_dot^2  - friction * x_dot  (+ stochastic kicks)
+//
+// Each voice is a test particle moving along this curved pitch-line. Near an
+// attractor the space is locally "denser" (larger metric), so a geodesic
+// slows down and can be captured -- an audible tonal gravity well. Away from
+// attractors it moves faster. Stochastic kicks let particles escape wells,
+// giving chaotic dwell/hop behavior reminiscent of a washboard potential.
+//
+// Each MIDI note-on spawns a particle at x = note - root, with an initial
+// velocity impulse (kick strength * velocity, random direction). It then
+// free-falls along the manifold. Note-off releases amplitude but the particle
+// keeps drifting until amplitude decays -- an ambient, generative texture.
+//
+// Loudness is also coupled to local "dwell time": slower motion (deep in a
+// well) sounds louder, faster motion (crossing open space) sounds quieter.
+// ============================================================================
+
+slider1:60<0,127,1>Root Note (MIDI)
+slider2:3<1,6,1>Voices
+slider3:1.5<0.1,6,0.01>Well Width (sigma, semitones)
+slider4:6<0,20,0.01>Curvature Depth
+slider5:0.5<0,4,0.001>Friction / Damping
+slider6:12<0,48,0.1>Kick Strength (semitones/sec)
+slider7:80<1,500,1>Glide / Envelope Time (ms)
+slider8:0.3<0,1,0.001>Stochastic Kick Probability
+slider9:0.4<0,1,0.001>Stochastic Kick Scale
+slider10:0<0,11,1>Attractor 1 Offset (semitones)
+slider11:1<0,1,0.001>Attractor 1 Weight
+slider12:4<0,11,1>Attractor 2 Offset
+slider13:0.8<0,1,0.001>Attractor 2 Weight
+slider14:7<0,11,1>Attractor 3 Offset
+slider15:0.8<0,1,0.001>Attractor 3 Weight
+slider16:0<0,11,1>Attractor 4 Offset
+slider17:0<0,1,0.001>Attractor 4 Weight
+slider18:0.3<0,1,0.001>Waveform Mix (Sine to Saw)
+slider19:0.5<0,2,0.001>Output Gain
+slider20:0.5<0,1,0.001>Dwell Amplitude Coupling
+slider21:16<1,128,1>ODE Integration Stride (samples)
+
+out_pin:left output
+out_pin:right output
+
+@init
+
+MAX_VOICES = 6;
+PI2 = 6.283185307179586;
+
+freemem = 0;
+voice_x     = freemem; freemem += MAX_VOICES;
+voice_v     = freemem; freemem += MAX_VOICES;
+voice_note  = freemem; freemem += MAX_VOICES;
+voice_held  = freemem; freemem += MAX_VOICES;
+voice_inuse = freemem; freemem += MAX_VOICES;
+voice_amp   = freemem; freemem += MAX_VOICES;
+voice_amp_t = freemem; freemem += MAX_VOICES;
+voice_freq_s= freemem; freemem += MAX_VOICES;
+voice_phase = freemem; freemem += MAX_VOICES;
+
+attr_off = freemem; freemem += 4;
+attr_w   = freemem; freemem += 4;
+
+vi = 0;
+loop(MAX_VOICES,
+  voice_x[vi] = 0;
+  voice_v[vi] = 0;
+  voice_note[vi] = -1;
+  voice_held[vi] = 0;
+  voice_inuse[vi] = 0;
+  voice_amp[vi] = 0;
+  voice_amp_t[vi] = 0;
+  voice_freq_s[vi] = 220;
+  voice_phase[vi] = 0;
+  vi += 1;
+);
+
+sample_counter = 0;
+
+// -- wrapped (circular, period 12) distance from x to attractor c ----------
+function wrapdist(x, c) local(d) (
+  d = x - c;
+  d = d - 12 * floor(d/12 + 0.5);
+  d;
+);
+
+// -- Christoffel symbol / phi'(x), summed over all attractor wells ---------
+function phi_prime(x) local(i, d, s) (
+  s = 0;
+  i = 0;
+  loop(4,
+    d = wrapdist(x, attr_off[i]);
+    s += attr_w[i] * d * exp(-(d*d) / (2*sigma2));
+    i += 1;
+  );
+  s * (depth / sigma2);
+);
+
+// -- potential phi(x) itself, used only for the @gfx display ---------------
+function phi_val(x) local(i, d, s) (
+  s = 0;
+  i = 0;
+  loop(4,
+    d = wrapdist(x, attr_off[i]);
+    s -= attr_w[i] * exp(-(d*d) / (2*sigma2));
+    i += 1;
+  );
+  s * depth;
+);
+
+// -- one semi-implicit Euler geodesic step for voice idx --------------------
+function geo_step(idx) local(x, v, a) (
+  x = voice_x[idx];
+  v = voice_v[idx];
+  a = -phi_prime(x) * v * v - friction * v;
+  v += a * dt;
+  v = max(min(v, 200), -200);
+  x += v * dt;
+  x > 48 ? ( x = 48;  v = -v*0.5; );
+  x < -48 ? ( x = -48; v = -v*0.5; );
+  voice_x[idx] = x;
+  voice_v[idx] = v;
+);
+
+// -- find a free voice, or steal the quietest one ---------------------------
+function alloc_voice() local(i, found) (
+  found = -1;
+  i = 0;
+  while (i < numvoices) (
+    (found == -1) && (voice_inuse[i] == 0) ? found = i;
+    i += 1;
+  );
+  found == -1 ? (
+    found = 0;
+    i = 1;
+    while (i < numvoices) (
+      voice_amp[i] < voice_amp[found] ? found = i;
+      i += 1;
+    );
+  );
+  found;
+);
+
+// -- polyBLEP band-limiting correction for the sawtooth ---------------------
+function poly_blep(t, dtp) local(r) (
+  t < dtp ? (
+    r = t/dtp - 1;
+  ) : (
+    t > 1 - dtp ? (
+      r = (t - 1)/dtp + 1;
+    ) : (
+      r = 0;
+    );
+  );
+  r;
+);
+
+function update_params() (
+  attr_off[0] = slider10; attr_w[0] = slider11;
+  attr_off[1] = slider12; attr_w[1] = slider13;
+  attr_off[2] = slider14; attr_w[2] = slider15;
+  attr_off[3] = slider16; attr_w[3] = slider17;
+  sigma2 = max(slider3*slider3, 0.0001);
+  depth = slider4;
+  friction = slider5;
+  kickstrength = slider6;
+  glide_ms = slider7;
+  kickprob = slider8;
+  kickscale = slider9;
+  wavemix = slider18;
+  outgain = slider19;
+  dwellcoupling = slider20;
+  divider = max(1, floor(slider21));
+  numvoices = max(1, min(MAX_VOICES, floor(slider2)));
+  root_note = slider1;
+  env_coef = exp(-1/(max(glide_ms,1)*0.001*srate));
+);
+
+update_params();
+
+@slider
+update_params();
+
+@block
+
+while (midirecv(offset, msg1, msg23)) (
+  status = msg1 & 240;
+  note = msg23 & 255;
+  vel = floor(msg23/256);
+
+  status == 144 && vel > 0 ? (
+    vidx = alloc_voice();
+    voice_note[vidx] = note;
+    voice_held[vidx] = 1;
+    voice_inuse[vidx] = 1;
+    voice_x[vidx] = note - root_note;
+    voice_v[vidx] = kickstrength * (vel/127) * (rand(2)-1);
+    voice_amp_t[vidx] = 1;
+  ) : (
+    (status == 128 || (status == 144 && vel == 0)) ? (
+      found2 = -1;
+      vi2 = 0;
+      while (vi2 < numvoices) (
+        (found2 == -1) && voice_held[vi2] && voice_note[vi2] == note ? found2 = vi2;
+        vi2 += 1;
+      );
+      found2 >= 0 ? (
+        voice_held[found2] = 0;
+        voice_amp_t[found2] = 0;
+      );
+    );
+  );
+);
+
+@sample
+
+sample_counter += 1;
+sample_counter >= divider ? (
+  sample_counter = 0;
+  dt = divider / srate;
+  vi3 = 0;
+  loop(numvoices,
+    voice_inuse[vi3] ? (
+      geo_step(vi3);
+      rand(1) < kickprob ? voice_v[vi3] += (rand(2)-1) * kickscale * 12;
+    );
+    vi3 += 1;
+  );
+);
+
+outL = 0;
+outR = 0;
+vi4 = 0;
+loop(numvoices,
+  voice_inuse[vi4] ? (
+    targetfreq = 440 * pow(2, (root_note + voice_x[vi4] - 69)/12);
+    voice_freq_s[vi4] = voice_freq_s[vi4]*env_coef + targetfreq*(1-env_coef);
+    voice_amp[vi4] = voice_amp[vi4]*env_coef + voice_amp_t[vi4]*(1-env_coef);
+    (voice_amp[vi4] < 0.0005) && (voice_held[vi4] == 0) ? voice_inuse[vi4] = 0;
+
+    dphase = voice_freq_s[vi4] / srate;
+    voice_phase[vi4] += dphase;
+    voice_phase[vi4] >= 1 ? voice_phase[vi4] -= 1;
+
+    sinev = sin(PI2 * voice_phase[vi4]);
+    sawv = 2*voice_phase[vi4] - 1 - poly_blep(voice_phase[vi4], dphase);
+    oscv = sinev*(1-wavemix) + sawv*wavemix;
+
+    dwell = 1 / (1 + dwellcoupling * abs(voice_v[vi4]));
+    voicegain = voice_amp[vi4] * dwell;
+
+    pan = numvoices > 1 ? vi4/(numvoices-1) : 0.5;
+    lg = cos(pan * PI2/4);
+    rg = sin(pan * PI2/4);
+
+    outL += oscv * voicegain * lg;
+    outR += oscv * voicegain * rg;
+  );
+  vi4 += 1;
+);
+
+spl0 = outL * outgain * 0.5;
+spl1 = outR * outgain * 0.5;
+
+@gfx 640 220
+
+gfx_r=0.04; gfx_g=0.04; gfx_b=0.06; gfx_a=1;
+gfx_rect(0,0,gfx_w,gfx_h);
+
+xmin = -48;
+xmax = 48;
+n = 200;
+pmin = 1000000;
+pmax = -1000000;
+i = 0;
+while (i <= n) (
+  xx = xmin + (xmax-xmin)*i/n;
+  pv = phi_val(xx);
+  pv < pmin ? pmin = pv;
+  pv > pmax ? pmax = pv;
+  i += 1;
+);
+prange = max(pmax-pmin, 0.0001);
+
+// attractor well lines (repeated every octave across the visible range)
+gfx_r=0.9; gfx_g=0.5; gfx_b=0.2; gfx_a=0.35;
+k = 0;
+loop(4,
+  attr_w[k] > 0.001 ? (
+    oct = -4;
+    while (oct <= 4) (
+      cxpos = attr_off[k] + 12*oct;
+      (cxpos >= xmin) && (cxpos <= xmax) ? (
+        lx = (cxpos-xmin)/(xmax-xmin)*gfx_w;
+        gfx_line(lx,0,lx,gfx_h);
+      );
+      oct += 1;
+    );
+  );
+  k += 1;
+);
+
+// phi(x) curve
+gfx_r=0.35; gfx_g=0.75; gfx_b=0.95; gfx_a=1;
+i = 0;
+lastpx = 0; lastpy = 0;
+while (i <= n) (
+  xx = xmin + (xmax-xmin)*i/n;
+  pv = phi_val(xx);
+  px = (xx-xmin)/(xmax-xmin)*gfx_w;
+  py = gfx_h - 20 - (pv-pmin)/prange*(gfx_h-40);
+  i > 0 ? gfx_line(lastpx,lastpy,px,py);
+  lastpx = px; lastpy = py;
+  i += 1;
+);
+
+// voice markers sitting on the curve
+gfx_r=1; gfx_g=0.9; gfx_b=0.2; gfx_a=1;
+v5 = 0;
+loop(numvoices,
+  voice_inuse[v5] ? (
+    vx = voice_x[v5];
+    (vx >= xmin) && (vx <= xmax) ? (
+      vpv = phi_val(vx);
+      vpx = (vx-xmin)/(xmax-xmin)*gfx_w;
+      vpy = gfx_h - 20 - (vpv-pmin)/prange*(gfx_h-40);
+      gfx_circle(vpx,vpy,4,1,1);
+    );
+  );
+  v5 += 1;
+);
+
+gfx_r=0.6; gfx_g=0.6; gfx_b=0.65; gfx_a=1;
+gfx_x=6; gfx_y=6;
+gfx_drawstr("phi(x): Riemannian pitch-space potential (blue) -- attractor wells (orange) -- voices (yellow)");

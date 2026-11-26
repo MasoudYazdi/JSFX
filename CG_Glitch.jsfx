@@ -1,0 +1,185 @@
+desc:CG Glitch - random micro-repeat / stutter events cut from your last 2 seconds
+tags:musique-concrete glitch stutter live
+slider1:1.5<0,8,0.01>Event Rate (events/s)
+slider2:0.4<0,1,0.01>Onset Trigger Probability
+slider3:15<4,400,1:log>Min Slice (ms)
+slider4:120<10,500,1:log>Max Slice (ms)
+slider5:8<2,16,1>Max Repeats
+slider6:0.1<0,0.4,0.001>Shrink Per Repeat (accelerate)
+slider7:0.2<0,1,0.01>Reverse Probability
+slider8:0<0,24,0.1>Pitch Variance (semitones)
+slider9:0.7<0,1,0.01>Duck Dry During Event
+slider10:0.6<0,1,0.01>Stereo Width
+slider11:-3<-60,6,0.1>Wet (dB)
+slider12:0<-60,6,0.1>Dry (dB)
+slider13:0<0,3,1{Auto,L,R,L+R}>Input
+slider14:1<1,4,1>Analysis Bus (1-4)
+slider15:0<0,6,1{None,Level,Onset,Brightness,Noisiness,Flux,Pitch}>Mod Source
+slider16:0<-1,1,0.01>Mod -> Event Rate (+-3 octaves)
+slider17:0<0,1,1{-,PANIC}>Panic / Clear
+
+in_pin:Input L
+in_pin:Input R
+out_pin:Output L
+out_pin:Output R
+options:gmem=CGbus no_meter
+
+@init
+
+ext_noinit=1;
+PI=3.141592653589793; TWOPI=6.283185307179586; CEIL=2;
+
+// ---- NaN-safe primitives. Comparisons with NaN are false, so every function below maps NaN/inf to a finite value ----
+function lim(x,lo,hi) ( x>=lo ? (x<=hi ? x : hi) : lo );
+function fin(x) ( abs(x)<100000 ? x : 0 );
+function db2lin(d) ( exp(lim(d,-120,60)*0.11512925464970229) );
+function dbgain(d) ( d<=-59.9 ? 0 : db2lin(d) );
+function lin2db(x) ( 8.685889638065035*log(abs(x)+0.000000001) );
+function sat(x) ( abs(x)<3 ? x*(27+x*x)/(27+9*x*x) : (x>0 ? 1 : -1) );
+function sclip(x,c) local(ax,k,y) ( ax=abs(x); k=c*0.7; y=ax<k ? ax : k+(c-k)*sat((ax-k)/(c-k)); x<0 ? -y : y );
+function mixf(a,b,t) ( a+(b-a)*t );
+function lpc(fc) ( 1-exp(-TWOPI*lim(fc,1,srate*0.45)/srate) );
+function smooth01(t) ( t<=0 ? 0 : (t>=1 ? 1 : t*t*(3-2*t)) );
+function rnd() ( rng=rng*1664525+1013904223; rng-=floor(rng/4294967296)*4294967296; rng/4294967296 );
+function rnds() ( rnd()*2-1 );
+function alloc(sz) local(p) ( p=mp; mp+=sz; memset(p,0,sz); p );
+
+// ---- mono input pick (guitar usually lives on one channel) + DC block ----
+function pick_in() local(yy) (
+  eL+=(inL*inL-eL)*0.0005; eR+=(inR*inR-eR)*0.0005;
+  imode<0.5 ? ( xm = eR<0.0005*eL ? inL : (eL<0.0005*eR ? inR : (inL+inR)*0.5) )
+  : ( imode<1.5 ? ( xm=inL ) : ( imode<2.5 ? ( xm=inR ) : ( xm=(inL+inR)*0.5 ) ) );
+  yy=xm-dcx+dcr*dcy; dcx=xm; dcy=yy; xm=fin(yy);
+);
+
+// ---- onset detector (fast/slow envelope ratio with refractory time) ----
+function ons_proc(x) local(a) (
+  a=abs(x);
+  ons_f+=(a-ons_f)*(a>ons_f ? ons_kfa : ons_kfr);
+  ons_s+=(a-ons_s)*(a>ons_s ? ons_ksa : ons_ksr);
+  ons_ev=0;
+  ons_cool>0 ? ons_cool-=1;
+  (ons_cool<=0 && ons_f>ons_thr && ons_f>ons_s*ons_ratio) ? ( ons_ev=1; ons_cool=ons_refr; ons_cnt+=1; );
+);
+
+// ---- analysis bus (written by CG_Analyzer, optional for every other module) ----
+function bus_update() (
+  bus_b=(lim(floor(bus_sel+0.5),1,4)-1)*16;
+  hb=gmem[bus_b];
+  abs(hb-hb_last)>0.5 ? ( hb_last=hb; bus_stale=0; ) : ( bus_stale+=samplesblock; );
+  bus_alive=bus_stale<srate*0.4;
+);
+function bus_get(sel) ( (sel>0.5 && bus_alive) ? lim(gmem[bus_b+floor(sel+0.5)],0,1) : 0 );
+function bus_onset() local(c,r) ( r=0; bus_alive ? ( c=gmem[bus_b+10]; abs(c-bus_cnt_last)>0.5 ? ( r=1; bus_cnt_last=c; ); ); r );
+mp=0;
+
+RB=floor(srate*2.5);
+ring=alloc(RB);
+rwp=0; ev=0; ending=0; ge=0; gstart=0; len0=0; len_cur=0; pos=0; grate=1; rep_cnt=0; reps=2; ev_age=0; evt=srate;
+gpl=0.7; gpr=0.7; k_ge=1-exp(-1/(0.006*srate)); fn=max(8,floor(0.0015*srate));
+rate_ev=1.5; p_ons=0.4; minms=15; maxms=120; maxrep=8; shrink=0.1; revp=0.2; pitchv=0; md_rate=0;
+
+function do_clear() ( memset(ring,0,RB); ev=0; ending=0; ge=0; );
+
+function start_event() local(a,b,ang,pan) (
+  a=log(max(min(minms,maxms),4)); b=log(max(maxms,minms));
+  len0=exp(mixf(a,b,rnd()))*0.001*srate; len0=lim(len0,48,srate*0.5);
+  reps=floor(2+rnd()*(max(maxrep,2)-1)); reps=lim(reps,2,16);
+  grate=exp(lim(rnds()*pitchv,-24,24)*0.05776226504666211);
+  rnd()<revp ? ( grate=-grate; );
+  gstart=rwp-len0; len_cur=len0; pos=grate<0 ? len_cur-1 : 0;
+  rep_cnt=0; ev_age=0; ending=0; ev=1;
+  pan=rnds()*P_width; ang=(pan*0.5+0.5)*1.5707963267948966; gpl=cos(ang); gpr=sin(ang);
+);
+
+function read_params() (
+
+bus_sel=slider14; imode=slider13; msel=slider15;
+T_wet=dbgain(slider11); T_dry=dbgain(slider12); T_duck=lim(slider9,0,1); T_width=lim(slider10,0,1);
+md_rate=lim(slider16,-1,1); mod_t=bus_get(msel);
+rate_ev=lim(slider1,0,8)*exp(md_rate*mod_s*2.0794415416798357); p_ons=lim(slider2,0,1);
+minms=lim(slider3,4,400); maxms=lim(slider4,10,500); maxrep=lim(slider5,2,16);
+shrink=lim(slider6,0,0.4); revp=lim(slider7,0,1); pitchv=lim(slider8,0,24);
+
+);
+function copy_params() ( P_wet=T_wet; P_dry=T_dry; P_duck=T_duck; P_width=T_width; );
+
+// ---- panic machine: fade wet out, clear every buffer, fade back in. Triggered by button or by internal watchdog ----
+function panic_step() (
+  (panic_req>0.5 && pan_ph==0) ? ( pan_ph=1; );
+  panic_req=0;
+  pan_ph==1 ? ( pan_g-=pan_dn; pan_g<=0 ? ( pan_g=0; do_clear(); pan_ph=2; pan_hold=floor(0.03*srate); ); );
+  pan_ph==2 ? ( pan_hold-=1; pan_hold<=0 ? ( pan_ph=3; ); );
+  pan_ph==3 ? ( pan_g+=pan_up; pan_g>=1 ? ( pan_g=1; pan_ph=0; ); );
+  pan_gs=pan_g*pan_g*(3-2*pan_g);
+);
+
+// ---- final stage: wet DC block, dry/wet sum, finite scrub, soft ceiling at +6 dB ----
+function finish() local(yy) (
+  wL=fin(wL); wR=fin(wR);
+  yy=wL-wxL+dcr*wyL; wxL=wL; wyL=yy; wL=yy;
+  yy=wR-wxR+dcr*wyR; wxR=wR; wyR=yy; wR=yy;
+  oL=sclip(fin(inL*P_dry+wL*P_wet*pan_gs),CEIL);
+  oR=sclip(fin(inR*P_dry+wR*P_wet*pan_gs),CEIL);
+  spl0=oL; spl1=oR;
+);
+
+smc=1-exp(-1/(0.015*srate));
+kmod=1-exp(-1/(0.004*srate));
+dcr=1-TWOPI*10/srate;
+pan_dn=1/(0.01*srate); pan_up=1/(0.05*srate); pan_g=1; pan_gs=1; pan_ph=0; panic_req=0;
+ons_kfa=1-exp(-1/(0.001*srate)); ons_kfr=1-exp(-1/(0.025*srate));
+ons_ksa=1-exp(-1/(0.040*srate)); ons_ksr=1-exp(-1/(0.250*srate));
+ons_ratio=2.2; ons_thr=db2lin(-52); ons_refr=floor(0.07*srate);
+bus_sel=1; imode=0; pfirst=1;
+rng=7013;
+
+@block
+
+bus_update();
+pan_btn=slider17; (pan_btn>0.5 && pan_prev<0.5) ? ( panic_req=1; ); pan_prev=pan_btn;
+read_params();
+pfirst ? ( copy_params(); pfirst=0; );
+
+
+@sample
+
+inL=fin(spl0); inR=fin(spl1);
+pick_in();
+ons_proc(xm);
+panic_step();
+mod_s+=(mod_t-mod_s)*kmod;
+P_wet+=(T_wet-P_wet)*smc;
+P_dry+=(T_dry-P_dry)*smc;
+P_duck+=(T_duck-P_duck)*smc;
+P_width+=(T_width-P_width)*smc;
+
+ring[rwp]=xm; rwp+=1; rwp>=RB ? (rwp=0);
+// triggers
+evt-=1;
+evt<=0 ? ( evt=rate_ev>0.001 ? srate/rate_ev*(0.5+rnd()) : srate*0.1; (rate_ev>0.001 && ev<0.5) ? start_event(); );
+(ons_ev && ev<0.5 && rnd()<p_ons) ? start_event();
+sL=0; sR=0;
+ev>0.5 ? (
+  ev_age+=1; ev_age>srate*1.6 ? ( ending=1; );
+  idx=gstart+pos; idx<0 ? (idx+=RB); idx>=RB ? (idx-=RB); idx<0 ? (idx=0);
+  i0=floor(idx); fr=idx-i0; i1=i0+1; i1>=RB ? (i1=0); i0>=RB ? (i0=RB-1);
+  sv=ring[i0]*(1-fr)+ring[i1]*fr;
+  wx=smooth01(min(1,min(pos/fn,(len_cur-pos)/fn)));
+  s=sv*wx;
+  sL=s*gpl*1.414; sR=s*gpr*1.414;
+  pos+=grate;
+  (pos>=len_cur || pos<0) ? (
+    rep_cnt+=1;
+    rep_cnt>=reps ? ( ending=1; );
+    len_cur=max(len_cur*(1-shrink),max(48,fn*3));
+    pos=grate<0 ? len_cur-1 : 0;
+  );
+);
+ge+=((ev>0.5 && ending<0.5 ? 1 : 0)-ge)*k_ge;
+(ev>0.5 && ending>0.5 && ge<0.001) ? ( ev=0; ending=0; ge=0; );
+wL=sL*ge; wR=sR*ge;
+sv_dry=P_dry; P_dry=sv_dry*(1-P_duck*ge);
+finish();
+P_dry=sv_dry;
+

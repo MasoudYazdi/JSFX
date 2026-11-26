@@ -1,0 +1,58 @@
+desc:CM Filter Sweep (Filtrage)
+// Concrete Music Suite -- resonant state-variable filter with an
+// LFO- and/or envelope-driven cutoff sweep. Models the "filtrage"
+// transformation: revealing/isolating spectral content of a sound
+// object by sweeping a narrow or resonant band through it.
+
+slider1:cutoff=1000<20,18000,1>Base Cutoff (Hz)
+slider2:res=0.3<0,0.99,0.001>Resonance
+slider3:mode=0<0,2,1{Lowpass,Bandpass,Highpass}>Filter Mode
+slider4:lforate=0.2<0.01,10,0.01>Sweep Rate (Hz)
+slider5:lfodepth=0<0,10,0.01>Sweep Depth (octaves)
+slider6:lfoshape=0<0,2,1{Sine,Triangle,Random S&H}>Sweep Shape
+slider7:envfollow=0<0,1,0.01>Envelope-Follow Amount
+
+in_pin:Left
+in_pin:Right
+out_pin:Left
+out_pin:Right
+
+@init
+lfophase = 0;
+sh_val = 0;
+env = 0;
+lp_L=0; bp_L=0; hp_L=0;
+lp_R=0; bp_R=0; hp_R=0;
+
+@sample
+inlevel = (abs(spl0)+abs(spl1))*0.5;
+env += (inlevel-env)*0.001;
+
+lfophase += 2*$pi*lforate/srate;
+lfophase >= 2*$pi ? (
+  lfophase -= 2*$pi;
+  lfoshape == 2 ? sh_val = rand(2)-1;
+);
+lfoshape == 0 ? lfoval = sin(lfophase);
+lfoshape == 1 ? lfoval = (2/$pi)*asin(sin(lfophase));
+lfoshape == 2 ? lfoval = sh_val;
+
+octshift = lfoval*lfodepth + env*envfollow*4;
+freq = cutoff * pow(2, octshift);
+freq < 20 ? freq = 20;
+freq > 18000 ? freq = 18000;
+
+f = 2*sin($pi*freq/srate);
+q = 1-res;
+
+bp_L += f*hp_L;
+lp_L += f*bp_L;
+hp_L = spl0 - lp_L - q*bp_L;
+
+bp_R += f*hp_R;
+lp_R += f*bp_R;
+hp_R = spl1 - lp_R - q*bp_R;
+
+mode == 0 ? ( spl0=lp_L; spl1=lp_R; );
+mode == 1 ? ( spl0=bp_L; spl1=bp_R; );
+mode == 2 ? ( spl0=hp_L; spl1=hp_R; );

@@ -1,0 +1,200 @@
+desc:CG RingShift - ring modulator + frequency shifter, carrier driven by pitch / envelope / analysis
+tags:musique-concrete ringmod frequency-shifter live
+slider1:1<0,1,0.01>Ring Amount
+slider2:0<0,1,0.01>Shift Amount
+slider3:220<0.1,4000,0.01:log>Carrier (Hz)
+slider4:0<0,2,1{Fixed,Pitch track (bus),Envelope}>Carrier Source
+slider5:1<0.25,8,0.001>Pitch Ratio (track mode)
+slider6:1<-3,3,0.01>Envelope Depth (octaves)
+slider7:0<0,1,0.001>Carrier Shape (sine>tri>square>noise)
+slider8:50<-2000,2000,0.1>Shift (Hz)
+slider9:0<0,0.7,0.001>Shift Feedback
+slider10:1<0,20,0.01>Stereo Detune (Hz)
+slider11:40<5,1000,1:log>Glide (ms)
+slider12:-3<-60,6,0.1>Wet (dB)
+slider13:0<-60,6,0.1>Dry (dB)
+slider14:0<0,3,1{Auto,L,R,L+R}>Input
+slider15:1<1,4,1>Analysis Bus (1-4)
+slider16:0<0,6,1{None,Level,Onset,Brightness,Noisiness,Flux,Pitch}>Mod Source
+slider17:0<-3,3,0.01>Mod -> Carrier (octaves)
+slider18:0<-1000,1000,1>Mod -> Shift (Hz)
+slider19:0<0,1,1{-,PANIC}>Panic / Clear
+
+in_pin:Input L
+in_pin:Input R
+out_pin:Output L
+out_pin:Output R
+options:gmem=CGbus no_meter
+
+@init
+
+ext_noinit=1;
+PI=3.141592653589793; TWOPI=6.283185307179586; CEIL=2;
+
+// ---- NaN-safe primitives. Comparisons with NaN are false, so every function below maps NaN/inf to a finite value ----
+function lim(x,lo,hi) ( x>=lo ? (x<=hi ? x : hi) : lo );
+function fin(x) ( abs(x)<100000 ? x : 0 );
+function db2lin(d) ( exp(lim(d,-120,60)*0.11512925464970229) );
+function dbgain(d) ( d<=-59.9 ? 0 : db2lin(d) );
+function lin2db(x) ( 8.685889638065035*log(abs(x)+0.000000001) );
+function sat(x) ( abs(x)<3 ? x*(27+x*x)/(27+9*x*x) : (x>0 ? 1 : -1) );
+function sclip(x,c) local(ax,k,y) ( ax=abs(x); k=c*0.7; y=ax<k ? ax : k+(c-k)*sat((ax-k)/(c-k)); x<0 ? -y : y );
+function mixf(a,b,t) ( a+(b-a)*t );
+function lpc(fc) ( 1-exp(-TWOPI*lim(fc,1,srate*0.45)/srate) );
+function smooth01(t) ( t<=0 ? 0 : (t>=1 ? 1 : t*t*(3-2*t)) );
+function rnd() ( rng=rng*1664525+1013904223; rng-=floor(rng/4294967296)*4294967296; rng/4294967296 );
+function rnds() ( rnd()*2-1 );
+function alloc(n) local(p) ( p=mp; mp+=n; memset(p,0,n); p );
+
+// ---- mono input pick (guitar usually lives on one channel) + DC block ----
+function pick_in() local(yy) (
+  eL+=(inL*inL-eL)*0.0005; eR+=(inR*inR-eR)*0.0005;
+  imode<0.5 ? ( xm = eR<0.0005*eL ? inL : (eL<0.0005*eR ? inR : (inL+inR)*0.5) )
+  : ( imode<1.5 ? ( xm=inL ) : ( imode<2.5 ? ( xm=inR ) : ( xm=(inL+inR)*0.5 ) ) );
+  yy=xm-dcx+dcr*dcy; dcx=xm; dcy=yy; xm=fin(yy);
+);
+
+// ---- onset detector (fast/slow envelope ratio with refractory time) ----
+function ons_proc(x) local(a) (
+  a=abs(x);
+  ons_f+=(a-ons_f)*(a>ons_f ? ons_kfa : ons_kfr);
+  ons_s+=(a-ons_s)*(a>ons_s ? ons_ksa : ons_ksr);
+  ons_ev=0;
+  ons_cool>0 ? ons_cool-=1;
+  (ons_cool<=0 && ons_f>ons_thr && ons_f>ons_s*ons_ratio) ? ( ons_ev=1; ons_cool=ons_refr; ons_cnt+=1; );
+);
+
+// ---- analysis bus (written by CG_Analyzer, optional for every other module) ----
+function bus_update() (
+  bus_b=(lim(floor(bus_sel+0.5),1,4)-1)*16;
+  hb=gmem[bus_b];
+  abs(hb-hb_last)>0.5 ? ( hb_last=hb; bus_stale=0; ) : ( bus_stale+=samplesblock; );
+  bus_alive=bus_stale<srate*0.4;
+);
+function bus_get(sel) ( (sel>0.5 && bus_alive) ? lim(gmem[bus_b+floor(sel+0.5)],0,1) : 0 );
+function bus_onset() local(c,r) ( r=0; bus_alive ? ( c=gmem[bus_b+10]; abs(c-bus_cnt_last)>0.5 ? ( r=1; bus_cnt_last=c; ); ); r );
+mp=0;
+
+hs=alloc(40);
+cphL=0; cphR=0.31; sphL=0; sphR=0; nzL=0; nzR=0; qprev=0; fbs=0; dn=0.000000000000001;
+lf=log(220); k_f=0.001; f_t=220; trk_hz=220; ef=0; lvl=0; ctl=0;
+carr=220; csrc=0; ratio=1; envd=1; md_car=0; md_sh=0;
+k_ea=1-exp(-1/(0.005*srate)); k_er=1-exp(-1/(0.08*srate));
+
+function do_clear() ( memset(hs,0,40); qprev=0; fbs=0; );
+function ap2(b,c,x) local(y) ( y=c*(x+b[3])-b[1]; b[1]=b[0]; b[0]=x; b[3]=b[2]; b[2]=y; y );
+function car(ph,nz) local(s,tr,sq,pos) (
+  s=sin(TWOPI*ph); tr=2*abs(2*ph-1)-1; sq=sat(s*6);
+  pos=P_shape*3;
+  s*max(0,1-pos)+tr*max(0,1-abs(pos-1))+sq*max(0,1-abs(pos-2))+nz*max(0,pos-2)
+);
+
+function read_params() (
+
+bus_sel=slider15; imode=slider14; msel=slider16;
+T_wet=dbgain(slider12); T_dry=dbgain(slider13);
+T_ramt=lim(slider1,0,1); T_shamt=lim(slider2,0,1); T_shape=lim(slider7,0,1);
+T_shift=lim(slider8,-2000,2000); T_fb=lim(slider9,0,0.7); T_det=lim(slider10,0,20);
+carr=lim(slider3,0.1,4000); csrc=slider4; ratio=lim(slider5,0.25,8); envd=lim(slider6,-3,3);
+md_car=lim(slider17,-3,3); md_sh=lim(slider18,-1000,1000);
+k_f=1-exp(-1/(lim(slider11,5,1000)*0.001*srate));
+mod_t=bus_get(msel);
+
+);
+function copy_params() ( P_wet=T_wet; P_dry=T_dry; P_ramt=T_ramt; P_shamt=T_shamt; P_shape=T_shape; P_shift=T_shift; P_fb=T_fb; P_det=T_det; );
+
+// ---- panic machine: fade wet out, clear every buffer, fade back in. Triggered by button or by internal watchdog ----
+function panic_step() (
+  (panic_req>0.5 && pan_ph==0) ? ( pan_ph=1; );
+  panic_req=0;
+  pan_ph==1 ? ( pan_g-=pan_dn; pan_g<=0 ? ( pan_g=0; do_clear(); pan_ph=2; pan_hold=floor(0.03*srate); ); );
+  pan_ph==2 ? ( pan_hold-=1; pan_hold<=0 ? ( pan_ph=3; ); );
+  pan_ph==3 ? ( pan_g+=pan_up; pan_g>=1 ? ( pan_g=1; pan_ph=0; ); );
+  pan_gs=pan_g*pan_g*(3-2*pan_g);
+);
+
+// ---- final stage: wet DC block, dry/wet sum, finite scrub, soft ceiling at +6 dB ----
+function finish() local(yy) (
+  wL=fin(wL); wR=fin(wR);
+  yy=wL-wxL+dcr*wyL; wxL=wL; wyL=yy; wL=yy;
+  yy=wR-wxR+dcr*wyR; wxR=wR; wyR=yy; wR=yy;
+  oL=sclip(fin(inL*P_dry+wL*P_wet*pan_gs),CEIL);
+  oR=sclip(fin(inR*P_dry+wR*P_wet*pan_gs),CEIL);
+  spl0=oL; spl1=oR;
+);
+
+smc=1-exp(-1/(0.015*srate));
+kmod=1-exp(-1/(0.004*srate));
+dcr=1-TWOPI*10/srate;
+pan_dn=1/(0.01*srate); pan_up=1/(0.05*srate); pan_g=1; pan_gs=1; pan_ph=0; panic_req=0;
+ons_kfa=1-exp(-1/(0.001*srate)); ons_kfr=1-exp(-1/(0.025*srate));
+ons_ksa=1-exp(-1/(0.040*srate)); ons_ksr=1-exp(-1/(0.250*srate));
+ons_ratio=2.2; ons_thr=db2lin(-52); ons_refr=floor(0.07*srate);
+bus_sel=1; imode=0; pfirst=1;
+rng=7005;
+
+@block
+
+bus_update();
+pan_btn=slider19; (pan_btn>0.5 && pan_prev<0.5) ? ( panic_req=1; ); pan_prev=pan_btn;
+read_params();
+pfirst ? ( copy_params(); pfirst=0; );
+
+
+@sample
+
+inL=fin(spl0); inR=fin(spl1);
+pick_in();
+ons_proc(xm);
+panic_step();
+mod_s+=(mod_t-mod_s)*kmod;
+P_wet+=(T_wet-P_wet)*smc;
+P_dry+=(T_dry-P_dry)*smc;
+P_ramt+=(T_ramt-P_ramt)*smc;
+P_shamt+=(T_shamt-P_shamt)*smc;
+P_shape+=(T_shape-P_shape)*smc;
+P_shift+=(T_shift-P_shift)*smc;
+P_fb+=(T_fb-P_fb)*smc;
+P_det+=(T_det-P_det)*smc;
+
+dn=-dn;
+x=xm;
+ax=abs(x); ef+=(ax-ef)*(ax>ef ? k_ea : k_er);
+// ---- control tick: carrier frequency target ----
+(ctl+=1)>=32 ? (
+  ctl=0;
+  lvl=lim((lin2db(ef)+60)/60,0,1);
+  (bus_alive && gmem[bus_b+7]>0.45 && gmem[bus_b+9]>50 && gmem[bus_b+9]<1500) ? ( trk_hz=gmem[bus_b+9]*ratio; );
+  f_t = csrc<0.5 ? carr : ( csrc<1.5 ? trk_hz : carr*exp(envd*lvl*0.6931471805599453) );
+  f_t=lim(f_t*exp(md_car*mod_s*0.6931471805599453),0.05,srate*0.4);
+);
+lf+=(log(f_t)-lf)*k_f;
+f=exp(lim(lf,-3,11.5));
+shz=P_shift+md_sh*mod_s;
+// ---- phase accumulators (wrapped, NaN-guarded) ----
+cphL+=lim(f-0.5*P_det,0.01,srate*0.45)/srate; cphL>=1 ? ( cphL-=floor(cphL); nzL=rnds(); ); (cphL>=0 && cphL<1) ? 0 : (cphL=0);
+cphR+=lim(f+0.5*P_det,0.01,srate*0.45)/srate; cphR>=1 ? ( cphR-=floor(cphR); nzR=rnds(); ); (cphR>=0 && cphR<1) ? 0 : (cphR=0);
+sphL+=(shz-0.5*P_det)/srate; sphL-=floor(sphL); (sphL>=0 && sphL<1) ? 0 : (sphL=0);
+sphR+=(shz+0.5*P_det)/srate; sphR-=floor(sphR); (sphR>=0 && sphR<1) ? 0 : (sphR=0);
+// ---- Hilbert pair (4 + 4 allpass sections in z^-2) ----
+xs=x+P_fb*fbs+dn;
+ia=ap2(hs,0.16175849836770106,xs);
+ia=ap2(hs+4,0.7330289323414905,ia);
+ia=ap2(hs+8,0.9453497003291133,ia);
+ia=ap2(hs+12,0.9905991566845292,ia);
+qb=ap2(hs+16,0.47940086558884,xs);
+qb=ap2(hs+20,0.8762184935393101,qb);
+qb=ap2(hs+24,0.9765975895081993,qb);
+qb=ap2(hs+28,0.9974992559355491,qb);
+qd=qprev; qprev=qb;
+aL=TWOPI*sphL; aR=TWOPI*sphR;
+sL=ia*cos(aL)-qd*sin(aL);
+sR=ia*cos(aR)-qd*sin(aR);
+yL=mixf(x,sL,P_shamt); yR=mixf(x,sR,P_shamt);
+yL=mixf(yL,yL*car(cphL,nzL),P_ramt);
+yR=mixf(yR,yR*car(cphR,nzR),P_ramt);
+fbs=sat((yL+yR)*0.5);
+wL=yL; wR=yR;
+(abs(wL)<20 && abs(wR)<20 && abs(fbs)<4) ? 0 : ( panic_req=1; wL=0; wR=0; fbs=0; );
+finish();
+
